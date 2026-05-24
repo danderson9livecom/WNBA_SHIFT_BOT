@@ -1,3 +1,4 @@
+
 import os
 import time
 import json
@@ -11,8 +12,28 @@ from twilio.rest import Client
 
 load_dotenv()
 
+# =========================
+# WNBA SHIFT V3.1
+# MARKET INEFFICIENCY BOT
+# COST-OPTIMIZED VERSION
+# =========================
+#
+# Main goal:
+# Find live market inefficiencies between -140 and +100.
+#
+# Cost-saving changes from V3:
+# 1. Does NOT pull ESPN summary every loop unless the game/line changed.
+# 2. Uses per-game sleep timing instead of treating every game the same.
+# 3. Skips heavy model work when market and score are unchanged.
+# 4. Stops monitoring obvious dead/blowout games.
+# 5. Uses alert cooldowns to avoid repeated reprocessing/spam.
+# 6. Pulls full markets in one odds call, but avoids summary/model calls unless needed.
+#
+# Expected API/runtime reduction:
+# Usually 50-70% fewer heavy summary/model cycles.
+
 TZ = ZoneInfo("America/Phoenix")
-STATE_FILE = "wnba_shift_state.json"
+STATE_FILE = "wnba_shift_state_v31_cost_optimized.json"
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -22,16 +43,52 @@ ALERT_TO_NUMBER = os.getenv("ALERT_TO_NUMBER", "")
 
 SPORT_KEY = "basketball_wnba"
 
+# Global sleep bounds
 SLOW_POLL_SECONDS = int(os.getenv("SLOW_POLL_SECONDS", "300"))
+PREGAME_POLL_SECONDS = int(os.getenv("PREGAME_POLL_SECONDS", "180"))
 ACTIVE_POLL_SECONDS = int(os.getenv("ACTIVE_POLL_SECONDS", "60"))
-FAST_POLL_SECONDS = int(os.getenv("FAST_POLL_SECONDS", "30"))
+FAST_POLL_SECONDS = int(os.getenv("FAST_POLL_SECONDS", "20"))
+LATE_FAST_POLL_SECONDS = int(os.getenv("LATE_FAST_POLL_SECONDS", "15"))
 
-PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "45"))
-MIN_CONFIDENCE = int(os.getenv("MIN_CONFIDENCE", "80"))
+PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "75"))
 
-TOTAL_EDGE_TRIGGER = float(os.getenv("TOTAL_EDGE_TRIGGER", "8.0"))
-SPREAD_EDGE_TRIGGER = float(os.getenv("SPREAD_EDGE_TRIGGER", "5.5"))
-MIN_LIVE_SPREAD_VALUE = float(os.getenv("MIN_LIVE_SPREAD_VALUE", "4.5"))
+# Playable price range
+MIN_PRICE = int(os.getenv("MIN_PRICE", "-140"))
+MAX_PRICE = int(os.getenv("MAX_PRICE", "100"))
+
+# Data validation
+MIN_ELAPSED_SECONDS = int(os.getenv("MIN_ELAPSED_SECONDS", "480"))
+MIN_VALID_FGA = int(os.getenv("MIN_VALID_FGA", "32"))
+MIN_VALID_POSSESSIONS = float(os.getenv("MIN_VALID_POSSESSIONS", "18"))
+MAX_VALID_PPP = float(os.getenv("MAX_VALID_PPP", "1.75"))
+
+# Market trigger thresholds
+SPREAD_MARKET_MOVE_TRIGGER = float(os.getenv("SPREAD_MARKET_MOVE_TRIGGER", "6.0"))
+TOTAL_MARKET_MOVE_TRIGGER = float(os.getenv("TOTAL_MARKET_MOVE_TRIGGER", "7.0"))
+MIN_SPREAD_EDGE = float(os.getenv("MIN_SPREAD_EDGE", "4.0"))
+MIN_TOTAL_EDGE = float(os.getenv("MIN_TOTAL_EDGE", "5.5"))
+MIN_MISPRICING_SCORE = int(os.getenv("MIN_MISPRICING_SCORE", "70"))
+
+# Skip/reprocess thresholds
+MIN_SCORE_CHANGE_TO_REMODEL = int(os.getenv("MIN_SCORE_CHANGE_TO_REMODEL", "2"))
+MIN_TOTAL_CHANGE_TO_REMODEL = float(os.getenv("MIN_TOTAL_CHANGE_TO_REMODEL", "1.5"))
+MIN_SPREAD_CHANGE_TO_REMODEL = float(os.getenv("MIN_SPREAD_CHANGE_TO_REMODEL", "1.0"))
+MIN_ML_CHANGE_TO_REMODEL = int(os.getenv("MIN_ML_CHANGE_TO_REMODEL", "20"))
+
+# No-bet filters
+MAX_SPREAD_PLAY = float(os.getenv("MAX_SPREAD_PLAY", "14.5"))
+MIN_POSSESSIONS_REMAINING = float(os.getenv("MIN_POSSESSIONS_REMAINING", "8"))
+
+# Dead-game filters
+DEAD_GAME_Q4_LEAD = int(os.getenv("DEAD_GAME_Q4_LEAD", "22"))
+DEAD_GAME_Q4_SECONDS = int(os.getenv("DEAD_GAME_Q4_SECONDS", "240"))
+
+# Cooldowns
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
+
+ENABLE_TOTAL_ALERTS = os.getenv("ENABLE_TOTAL_ALERTS", "true").lower() == "true"
+ENABLE_SPREAD_ALERTS = os.getenv("ENABLE_SPREAD_ALERTS", "true").lower() == "true"
+ENABLE_MONEYLINE_ALERTS = os.getenv("ENABLE_MONEYLINE_ALERTS", "true").lower() == "true"
 
 TEAM_ALIASES = {
     "las vegas aces": "aces",
@@ -47,10 +104,12 @@ TEAM_ALIASES = {
     "dallas wings": "wings",
     "los angeles sparks": "sparks",
     "golden state valkyries": "valkyries",
-    "portland fire": "fire",
-    "toronto tempo": "tempo",
 }
 
+
+# =========================
+# BASIC HELPERS
+# =========================
 
 def now_local():
     return datetime.now(TZ)
@@ -64,13 +123,17 @@ def espn_date():
     return now_local().strftime("%Y%m%d")
 
 
-def safe_float(x, default=0.0):
+def now_ts():
+    return int(time.time())
+
+
+def safe_float(x, default=None):
     try:
         if x is None:
             return default
         if isinstance(x, str):
             x = x.replace("%", "").replace(",", "").strip()
-            if x in ["", "--"]:
+            if x in ["", "--", "None"]:
                 return default
         return float(x)
     except Exception:
@@ -78,20 +141,12 @@ def safe_float(x, default=0.0):
 
 
 def safe_int(x, default=0):
-    try:
-        return int(float(str(x).replace("%", "").replace(",", "").strip()))
-    except Exception:
-        return default
+    v = safe_float(x, None)
+    return int(v) if v is not None else default
 
 
 def clamp(x, low=0, high=100):
     return max(low, min(high, x))
-
-
-def avg(nums):
-    clean = [safe_float(x, None) for x in nums if x is not None]
-    clean = [x for x in clean if x is not None]
-    return round(sum(clean) / len(clean), 2) if clean else 0
 
 
 def clean_team(name):
@@ -104,7 +159,7 @@ def clean_team(name):
 def parse_made_att(value):
     if value is None:
         return 0, 0
-    s = str(value)
+    s = str(value).strip()
     if "-" in s:
         made, att = s.split("-", 1)
         return safe_int(made), safe_int(att)
@@ -120,6 +175,35 @@ def parse_clock_to_seconds(clock):
         return safe_int(mins) * 60 + safe_int(secs)
     return safe_int(s)
 
+
+def price_ok(price):
+    price = safe_int(price, None)
+    if price is None:
+        return False
+    return MIN_PRICE <= price <= MAX_PRICE
+
+
+def line_changed(prev, current, threshold):
+    if prev is None or current is None:
+        return True
+    try:
+        return abs(float(current) - float(prev)) >= threshold
+    except Exception:
+        return True
+
+
+def ml_changed(prev, current, threshold):
+    if prev is None or current is None:
+        return True
+    try:
+        return abs(int(current) - int(prev)) >= threshold
+    except Exception:
+        return True
+
+
+# =========================
+# TEXT / HEALTH
+# =========================
 
 def send_text(msg):
     print("\n" + msg + "\n")
@@ -138,7 +222,7 @@ def send_text(msg):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"WNBA SHIFT BOT RUNNING"
+        body = b"WNBA SHIFT V3.1 COST-OPTIMIZED MARKET INEFFICIENCY BOT RUNNING"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -151,6 +235,41 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     print(f"Health server running on port {port}")
     server.serve_forever()
+
+
+# =========================
+# STATE
+# =========================
+
+def default_game_state():
+    return {
+        "opening_total": None,
+        "opening_home_spread": None,
+        "opening_away_spread": None,
+        "opening_home_ml": None,
+        "opening_away_ml": None,
+
+        "last_total": None,
+        "last_home_spread": None,
+        "last_away_spread": None,
+        "last_home_ml": None,
+        "last_away_ml": None,
+        "last_score_sum": None,
+        "last_home_score": None,
+        "last_away_score": None,
+
+        "last_heavy_check_ts": 0,
+        "last_light_check_ts": 0,
+        "next_allowed_check_ts": 0,
+
+        "line_snapshots": [],
+        "alerts": [],
+        "alert_times": {},
+
+        "started_text_sent": False,
+        "final_logged": False,
+        "dead_game": False,
+    }
 
 
 def load_state():
@@ -173,6 +292,10 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
+
+# =========================
+# API CALLS
+# =========================
 
 def get_schedule():
     url = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
@@ -226,6 +349,10 @@ def get_odds():
         return []
 
 
+# =========================
+# SCHEDULE / ODDS PARSING
+# =========================
+
 def parse_start_time(event):
     raw = event.get("date")
     if not raw:
@@ -259,8 +386,6 @@ def parse_event_basic(event):
             away = c
 
     status = event.get("status", {}).get("type", {})
-    state = status.get("state", "pre")
-    detail = status.get("detail", "")
 
     return {
         "event_id": str(event.get("id")),
@@ -268,8 +393,7 @@ def parse_event_basic(event):
         "away": away.get("team", {}).get("displayName", "Away"),
         "home_score": safe_int(home.get("score")),
         "away_score": safe_int(away.get("score")),
-        "state": state,
-        "detail": detail,
+        "state": status.get("state", "pre"),
         "start_time": parse_start_time(event),
     }
 
@@ -286,6 +410,7 @@ def find_odds(odds_events, home, away):
             continue
 
         result = {
+            "matched": True,
             "total": None,
             "over_price": None,
             "under_price": None,
@@ -293,6 +418,9 @@ def find_odds(odds_events, home, away):
             "away_spread": None,
             "home_spread_price": None,
             "away_spread_price": None,
+            "home_ml_price": None,
+            "away_ml_price": None,
+            "book_count": len(ev.get("bookmakers", [])),
         }
 
         for book in ev.get("bookmakers", []):
@@ -308,7 +436,7 @@ def find_odds(odds_events, home, away):
                             result["total"] = out.get("point")
                             result["under_price"] = out.get("price")
 
-                if key == "spreads":
+                elif key == "spreads":
                     for out in market.get("outcomes", []):
                         name = clean_team(out.get("name"))
 
@@ -320,10 +448,53 @@ def find_odds(odds_events, home, away):
                             result["away_spread"] = out.get("point")
                             result["away_spread_price"] = out.get("price")
 
+                elif key == "h2h":
+                    for out in market.get("outcomes", []):
+                        name = clean_team(out.get("name"))
+
+                        if name == ch:
+                            result["home_ml_price"] = out.get("price")
+
+                        if name == ca:
+                            result["away_ml_price"] = out.get("price")
+
         return result
 
     print(f"NO ODDS MATCH FOR: {away} at {home}")
-    return {}
+    return {"matched": False, "book_count": 0}
+
+
+# =========================
+# BOX SCORE / ADVANCED DATA
+# =========================
+
+def map_stat_key(name):
+    k = name.lower().replace(" ", "_").replace("-", "_")
+
+    mapping = {
+        "field_goals": "fg",
+        "fg": "fg",
+        "three_point_field_goals": "3pt",
+        "3pt": "3pt",
+        "free_throws": "ft",
+        "ft": "ft",
+        "offensive_rebounds": "orb",
+        "oreb": "orb",
+        "defensive_rebounds": "drb",
+        "dreb": "drb",
+        "rebounds": "reb",
+        "total_rebounds": "reb",
+        "assists": "ast",
+        "steals": "stl",
+        "blocks": "blk",
+        "turnovers": "tov",
+        "fouls": "fouls",
+        "personal_fouls": "fouls",
+        "fast_break_points": "fast_break",
+        "points_in_paint": "paint",
+    }
+
+    return mapping.get(k, k)
 
 
 def normalize_team_stats(raw):
@@ -334,23 +505,16 @@ def normalize_team_stats(raw):
     ftm = safe_int(raw.get("ftm"))
     fta = safe_int(raw.get("fta"))
 
-    def find_value(keys):
-        for k, v in raw.items():
-            low = k.lower()
-            if any(x in low for x in keys):
-                return safe_float(v)
-        return 0
-
-    orb = find_value(["offensive_rebounds", "offensive rebounds", "oreb"])
-    drb = find_value(["defensive_rebounds", "defensive rebounds", "dreb"])
-    reb = find_value(["total_rebounds", "total rebounds", "rebounds"])
-    ast = find_value(["assists"])
-    stl = find_value(["steals"])
-    blk = find_value(["blocks"])
-    tov = find_value(["turnovers"])
-    fouls = find_value(["fouls", "personal"])
-    fast_break = find_value(["fast_break", "fast break"])
-    paint = find_value(["points_in_paint", "paint"])
+    orb = safe_int(raw.get("orb"))
+    drb = safe_int(raw.get("drb"))
+    reb = safe_int(raw.get("reb"))
+    ast = safe_int(raw.get("ast"))
+    stl = safe_int(raw.get("stl"))
+    blk = safe_int(raw.get("blk"))
+    tov = safe_int(raw.get("tov"))
+    fouls = safe_int(raw.get("fouls"))
+    fast_break = safe_int(raw.get("fast_break"))
+    paint = safe_int(raw.get("paint"))
 
     efg = ((fgm + 0.5 * tpm) / fga * 100) if fga else 0
     fg_pct = (fgm / fga * 100) if fga else 0
@@ -383,12 +547,11 @@ def normalize_team_stats(raw):
 
 def team_stats_from_summary(summary):
     result = {"home": normalize_team_stats({}), "away": normalize_team_stats({})}
-
     box = summary.get("boxscore", {})
-    teams = box.get("teams", [])
 
-    for t in teams:
+    for t in box.get("teams", []):
         side = t.get("homeAway")
+
         if side not in ["home", "away"]:
             continue
 
@@ -396,24 +559,17 @@ def team_stats_from_summary(summary):
 
         for s in t.get("statistics", []):
             name = s.get("name") or s.get("label") or ""
-            key = name.lower().replace(" ", "_")
             value = s.get("displayValue", s.get("value"))
-            raw[key] = value
+            key = map_stat_key(name)
 
-            if "field_goals" in key or key == "fg":
-                made, att = parse_made_att(value)
-                raw["fgm"] = made
-                raw["fga"] = att
-
-            if "three_point" in key or key == "3pt":
-                made, att = parse_made_att(value)
-                raw["3pm"] = made
-                raw["3pa"] = att
-
-            if "free_throws" in key or key == "ft":
-                made, att = parse_made_att(value)
-                raw["ftm"] = made
-                raw["fta"] = att
+            if key == "fg":
+                raw["fgm"], raw["fga"] = parse_made_att(value)
+            elif key == "3pt":
+                raw["3pm"], raw["3pa"] = parse_made_att(value)
+            elif key == "ft":
+                raw["ftm"], raw["fta"] = parse_made_att(value)
+            elif key in ["orb", "drb", "reb", "ast", "stl", "blk", "tov", "fouls", "fast_break", "paint"]:
+                raw[key] = safe_int(value)
 
         result[side] = normalize_team_stats(raw)
 
@@ -451,44 +607,44 @@ def player_stats_from_summary(summary):
 def player_impact(players):
     impact = {
         "foul_trouble": [],
-        "abnormal": [],
-        "usage_pressure": 0,
+        "hot": [],
+        "cold_high_usage": [],
+        "turnover_pressure": [],
     }
 
     for p in players:
         name = p.get("name", "Unknown")
-        pts = safe_float(p.get("pts"))
-        fga = safe_float(p.get("fga"))
-        fouls = safe_float(p.get("pf", p.get("fouls", 0)))
-        turnovers = safe_float(p.get("to", p.get("turnovers", 0)))
+        pts = safe_float(p.get("pts"), 0)
+        fga = safe_float(p.get("fga"), 0)
+        fgm = safe_float(p.get("fgm"), None)
+        fouls = safe_float(p.get("pf", p.get("fouls", 0)), 0)
+        turnovers = safe_float(p.get("to", p.get("turnovers", 0)), 0)
         mins_raw = p.get("min", p.get("minutes", "0"))
 
         if isinstance(mins_raw, str) and ":" in mins_raw:
-            minutes = safe_float(mins_raw.split(":")[0])
+            minutes = safe_float(mins_raw.split(":")[0], 0)
         else:
-            minutes = safe_float(mins_raw)
+            minutes = safe_float(mins_raw, 0)
 
         if fouls >= 4:
             impact["foul_trouble"].append(f"{name}: {int(fouls)} fouls")
         elif fouls >= 3 and minutes <= 24:
             impact["foul_trouble"].append(f"{name}: {int(fouls)} early fouls")
 
-        if minutes > 0:
-            pts_per_36 = pts / minutes * 36
-            fga_per_36 = fga / minutes * 36
+        if fga >= 8 and fgm is not None:
+            fg_pct = fgm / fga if fga else 0
 
-            if pts_per_36 >= 35 and minutes >= 8:
-                impact["abnormal"].append(f"{name}: hot scoring pace {round(pts_per_36, 1)} pts/36")
+            if fg_pct <= 0.30:
+                impact["cold_high_usage"].append(f"{name}: {int(fgm)}/{int(fga)} shooting")
 
-            if fga_per_36 >= 24 and minutes >= 8:
-                impact["usage_pressure"] += 10
+            if fg_pct >= 0.65 and pts >= 12:
+                impact["hot"].append(f"{name}: {int(fgm)}/{int(fga)} shooting")
 
-            if turnovers >= 4:
-                impact["abnormal"].append(f"{name}: {int(turnovers)} turnovers")
+        if turnovers >= 4:
+            impact["turnover_pressure"].append(f"{name}: {int(turnovers)} turnovers")
 
-    impact["usage_pressure"] = clamp(impact["usage_pressure"])
-    impact["foul_trouble"] = impact["foul_trouble"][:4]
-    impact["abnormal"] = impact["abnormal"][:4]
+    for k in impact:
+        impact[k] = impact[k][:3]
 
     return impact
 
@@ -496,6 +652,7 @@ def player_impact(players):
 def game_clock_context(summary):
     comp = summary.get("header", {}).get("competitions", [{}])[0]
     status = comp.get("status", {})
+
     period = safe_int(status.get("period", 0))
     clock = status.get("displayClock", "")
 
@@ -508,14 +665,13 @@ def game_clock_context(summary):
 
     total_seconds = 2400
     remaining = max(0, total_seconds - elapsed)
-    game_fraction = elapsed / total_seconds if total_seconds else 0
 
     return {
         "period": period,
         "clock": clock,
         "elapsed": elapsed,
         "remaining": remaining,
-        "game_fraction": game_fraction,
+        "game_fraction": elapsed / total_seconds if total_seconds else 0,
     }
 
 
@@ -523,10 +679,7 @@ def estimate_possessions(home_stats, away_stats):
     def poss(s):
         return s["fga"] + 0.44 * s["fta"] - s["orb"] + s["tov"]
 
-    home_poss = poss(home_stats)
-    away_poss = poss(away_stats)
-
-    return max(1, (home_poss + away_poss) / 2)
+    return max(0, (poss(home_stats) + poss(away_stats)) / 2)
 
 
 def live_advanced(summary, basic):
@@ -534,440 +687,544 @@ def live_advanced(summary, basic):
     players = player_stats_from_summary(summary)
     clock = game_clock_context(summary)
 
-    home_stats = teams["home"]
-    away_stats = teams["away"]
+    h = teams["home"]
+    a = teams["away"]
 
-    poss = estimate_possessions(home_stats, away_stats)
+    poss = estimate_possessions(h, a)
     game_fraction = max(clock["game_fraction"], 0.01)
 
-    projected_possessions = poss / game_fraction
-    projected_possessions = clamp(projected_possessions, 60, 95)
+    projected_possessions = clamp(poss / game_fraction if poss > 0 else 0, 60, 95)
 
     total_points = basic["home_score"] + basic["away_score"]
     current_margin_home = basic["home_score"] - basic["away_score"]
 
     live_ppp = total_points / poss if poss else 0
-    projected_total_simple = total_points / game_fraction if game_fraction > 0 else 0
 
-    home_ppp = basic["home_score"] / poss if poss else 0
-    away_ppp = basic["away_score"] / poss if poss else 0
-
-    combined_efg = avg([home_stats["efg"], away_stats["efg"]])
-    combined_3p = avg([home_stats["three_pct"], away_stats["three_pct"]])
-    combined_ft_rate = avg([home_stats["ft_rate"], away_stats["ft_rate"]])
-    combined_tov = home_stats["tov"] + away_stats["tov"]
-    combined_orb = home_stats["orb"] + away_stats["orb"]
-    combined_fast_break = home_stats["fast_break"] + away_stats["fast_break"]
-    combined_fouls = home_stats["fouls"] + away_stats["fouls"]
+    seconds_remaining = clock["remaining"]
+    possessions_remaining = max(0, (seconds_remaining / 2400) * projected_possessions)
 
     return {
         "clock": clock,
-        "home_stats": home_stats,
-        "away_stats": away_stats,
+        "home_stats": h,
+        "away_stats": a,
         "home_player": player_impact(players["home"]),
         "away_player": player_impact(players["away"]),
         "possessions": round(poss, 1),
         "projected_possessions": round(projected_possessions, 1),
+        "possessions_remaining": round(possessions_remaining, 1),
         "live_ppp": round(live_ppp, 3),
-        "home_ppp": round(home_ppp, 3),
-        "away_ppp": round(away_ppp, 3),
-        "projected_total_simple": round(projected_total_simple, 1),
+        "home_ppp": round(basic["home_score"] / poss, 3) if poss else 0,
+        "away_ppp": round(basic["away_score"] / poss, 3) if poss else 0,
+        "projected_total_simple": round(total_points / game_fraction, 1) if game_fraction else 0,
         "current_margin_home": current_margin_home,
-        "combined_efg": combined_efg,
-        "combined_3p": combined_3p,
-        "combined_ft_rate": combined_ft_rate,
-        "combined_tov": combined_tov,
-        "combined_orb": combined_orb,
-        "combined_fast_break": combined_fast_break,
-        "combined_fouls": combined_fouls,
+        "combined_efg": round((h["efg"] + a["efg"]) / 2, 1),
+        "combined_3p": round((h["three_pct"] + a["three_pct"]) / 2, 1),
+        "combined_ft_rate": round((h["ft_rate"] + a["ft_rate"]) / 2, 1),
+        "combined_tov": h["tov"] + a["tov"],
+        "combined_orb": h["orb"] + a["orb"],
+        "combined_reb": h["reb"] + a["reb"],
+        "combined_fast_break": h["fast_break"] + a["fast_break"],
+        "combined_fouls": h["fouls"] + a["fouls"],
     }
 
 
-def market_over_pressure(opening, live):
-    if opening is None or live is None:
-        return 0
+# =========================
+# COST OPTIMIZATION
+# =========================
 
-    drop = opening - live
+def update_openers_if_pregame(game_state, odds_data, state_type):
+    if state_type == "in":
+        return
 
-    if drop >= 12:
-        return 100
-    if drop >= 10:
-        return 92
-    if drop >= 8:
-        return 84
-    if drop >= 6:
-        return 72
-    if drop >= 4:
-        return 58
-    if drop >= 2:
-        return 42
+    if game_state["opening_total"] is None and odds_data.get("total") is not None:
+        game_state["opening_total"] = odds_data.get("total")
 
-    return 15
+    if game_state["opening_home_spread"] is None and odds_data.get("home_spread") is not None:
+        game_state["opening_home_spread"] = odds_data.get("home_spread")
 
+    if game_state["opening_away_spread"] is None and odds_data.get("away_spread") is not None:
+        game_state["opening_away_spread"] = odds_data.get("away_spread")
 
-def market_under_pressure(opening, live):
-    if opening is None or live is None:
-        return 0
+    if game_state["opening_home_ml"] is None and odds_data.get("home_ml_price") is not None:
+        game_state["opening_home_ml"] = odds_data.get("home_ml_price")
 
-    rise = live - opening
-
-    if rise >= 12:
-        return 100
-    if rise >= 10:
-        return 92
-    if rise >= 8:
-        return 84
-    if rise >= 6:
-        return 72
-    if rise >= 4:
-        return 58
-    if rise >= 2:
-        return 42
-
-    return 15
+    if game_state["opening_away_ml"] is None and odds_data.get("away_ml_price") is not None:
+        game_state["opening_away_ml"] = odds_data.get("away_ml_price")
 
 
-def pace_score(adv):
-    proj = adv["projected_possessions"]
+def meaningful_change(game_state, basic, odds_data):
+    score_sum = basic["home_score"] + basic["away_score"]
 
-    if proj >= 86:
-        return 95
-    if proj >= 83:
-        return 85
-    if proj >= 80:
-        return 72
-    if proj >= 77:
-        return 55
-    if proj >= 74:
-        return 38
+    if game_state.get("last_score_sum") is None:
+        return True, "first_live_check"
 
-    return 20
+    if abs(score_sum - game_state.get("last_score_sum", 0)) >= MIN_SCORE_CHANGE_TO_REMODEL:
+        return True, "score_changed"
 
+    if line_changed(game_state.get("last_total"), odds_data.get("total"), MIN_TOTAL_CHANGE_TO_REMODEL):
+        return True, "total_changed"
 
-def slow_down_score(adv):
-    proj = adv["projected_possessions"]
+    if line_changed(game_state.get("last_home_spread"), odds_data.get("home_spread"), MIN_SPREAD_CHANGE_TO_REMODEL):
+        return True, "spread_changed"
 
-    if proj <= 70:
-        return 95
-    if proj <= 73:
-        return 82
-    if proj <= 76:
-        return 68
-    if proj <= 78:
-        return 52
+    if ml_changed(game_state.get("last_home_ml"), odds_data.get("home_ml_price"), MIN_ML_CHANGE_TO_REMODEL):
+        return True, "moneyline_changed"
 
-    return 25
+    return False, "unchanged"
 
 
-def shooting_over_score(adv):
-    score = 0
-
-    if adv["combined_efg"] < 42:
-        score += 35
-    elif adv["combined_efg"] < 46:
-        score += 22
-    elif adv["combined_efg"] < 50:
-        score += 10
-
-    if adv["combined_3p"] < 25:
-        score += 22
-    elif adv["combined_3p"] < 30:
-        score += 12
-
-    if adv["combined_ft_rate"] >= 30:
-        score += 20
-    elif adv["combined_ft_rate"] >= 24:
-        score += 12
-
-    if adv["combined_orb"] >= 14:
-        score += 15
-    elif adv["combined_orb"] >= 10:
-        score += 9
-
-    if adv["combined_fast_break"] >= 18:
-        score += 12
-    elif adv["combined_fast_break"] >= 12:
-        score += 7
-
-    return clamp(score)
+def update_last_market_state(game_state, basic, odds_data):
+    game_state["last_total"] = odds_data.get("total")
+    game_state["last_home_spread"] = odds_data.get("home_spread")
+    game_state["last_away_spread"] = odds_data.get("away_spread")
+    game_state["last_home_ml"] = odds_data.get("home_ml_price")
+    game_state["last_away_ml"] = odds_data.get("away_ml_price")
+    game_state["last_score_sum"] = basic["home_score"] + basic["away_score"]
+    game_state["last_home_score"] = basic["home_score"]
+    game_state["last_away_score"] = basic["away_score"]
 
 
-def shooting_under_score(adv):
-    score = 0
+def record_snapshot(game_state, basic, odds_data, clock=None):
+    snapshot = {
+        "time": now_local().isoformat(),
+        "period": clock.get("period") if clock else None,
+        "clock": clock.get("clock") if clock else None,
+        "total": odds_data.get("total"),
+        "home_spread": odds_data.get("home_spread"),
+        "away_spread": odds_data.get("away_spread"),
+        "home_ml": odds_data.get("home_ml_price"),
+        "away_ml": odds_data.get("away_ml_price"),
+        "score": f"{basic['away_score']}-{basic['home_score']}",
+    }
 
-    if adv["combined_efg"] >= 58:
-        score += 35
-    elif adv["combined_efg"] >= 54:
-        score += 24
-    elif adv["combined_efg"] >= 51:
-        score += 12
-
-    if adv["combined_3p"] >= 48:
-        score += 25
-    elif adv["combined_3p"] >= 42:
-        score += 16
-    elif adv["combined_3p"] >= 38:
-        score += 8
-
-    if adv["combined_tov"] >= 20:
-        score += 15
-
-    return clamp(score)
+    game_state["line_snapshots"].append(snapshot)
+    game_state["line_snapshots"] = game_state["line_snapshots"][-20:]
 
 
-def foul_total_score(adv):
-    score = 0
+def game_interval_seconds(basic, game_state, near_strike=False):
+    if game_state.get("dead_game"):
+        return SLOW_POLL_SECONDS
 
-    if adv["combined_fouls"] >= 32:
-        score += 35
-    elif adv["combined_fouls"] >= 26:
-        score += 24
-    elif adv["combined_fouls"] >= 20:
-        score += 12
+    start_time = basic.get("start_time")
+    state_type = basic.get("state")
 
-    if adv["combined_ft_rate"] >= 32:
-        score += 30
-    elif adv["combined_ft_rate"] >= 25:
-        score += 18
+    if state_type != "in":
+        if not start_time:
+            return SLOW_POLL_SECONDS
 
-    return clamp(score)
+        minutes_until = (start_time - now_local()).total_seconds() / 60
+
+        if minutes_until > PREGAME_WINDOW_MINUTES:
+            return SLOW_POLL_SECONDS
+
+        return PREGAME_POLL_SECONDS
+
+    if near_strike:
+        return FAST_POLL_SECONDS
+
+    return ACTIVE_POLL_SECONDS
 
 
-def project_total(opening, live, adv):
-    if opening is None:
+def should_skip_game_this_loop(game_state):
+    return now_ts() < game_state.get("next_allowed_check_ts", 0)
+
+
+def set_next_check(game_state, basic, near_strike=False):
+    interval = game_interval_seconds(basic, game_state, near_strike)
+    game_state["next_allowed_check_ts"] = now_ts() + interval
+    return interval
+
+
+def alert_allowed(game_state, alert_key):
+    last = game_state.get("alert_times", {}).get(alert_key)
+    if last is None:
+        return True
+    return now_ts() - int(last) >= ALERT_COOLDOWN_SECONDS
+
+
+def mark_alert_sent(game_state, alert_key):
+    if "alert_times" not in game_state:
+        game_state["alert_times"] = {}
+    game_state["alert_times"][alert_key] = now_ts()
+    if alert_key not in game_state["alerts"]:
+        game_state["alerts"].append(alert_key)
+
+
+# =========================
+# VALIDATION / FILTERS
+# =========================
+
+def validate_live_data(odds_data, adv):
+    reasons = []
+
+    if not odds_data.get("matched"):
+        reasons.append("odds_not_matched")
+
+    if odds_data.get("book_count", 0) <= 0:
+        reasons.append("no_bookmakers")
+
+    if adv["clock"]["elapsed"] < MIN_ELAPSED_SECONDS:
+        reasons.append("too_early")
+
+    h = adv["home_stats"]
+    a = adv["away_stats"]
+
+    combined_fga = h["fga"] + a["fga"]
+
+    if combined_fga < MIN_VALID_FGA:
+        reasons.append(f"bad_or_missing_fga:{combined_fga}")
+
+    if adv["possessions"] < MIN_VALID_POSSESSIONS:
+        reasons.append(f"bad_possessions:{adv['possessions']}")
+
+    if adv["live_ppp"] <= 0 or adv["live_ppp"] > MAX_VALID_PPP:
+        reasons.append(f"impossible_ppp:{adv['live_ppp']}")
+
+    if adv["combined_efg"] == 0:
+        reasons.append("zero_efg")
+
+    return {
+        "valid": len(reasons) == 0,
+        "reasons": reasons,
+    }
+
+
+def no_bet_filter(market_type, line, price, adv, odds_data):
+    reasons = []
+
+    if not price_ok(price):
+        reasons.append(f"price_outside_range:{price}")
+
+    if adv["possessions_remaining"] < MIN_POSSESSIONS_REMAINING:
+        reasons.append(f"too_few_possessions_left:{adv['possessions_remaining']}")
+
+    if market_type == "spread":
+        if line is None:
+            reasons.append("missing_spread")
+        elif abs(float(line)) > MAX_SPREAD_PLAY:
+            reasons.append(f"spread_too_large:{line}")
+
+    if market_type == "total" and odds_data.get("total") is None:
+        reasons.append("missing_total")
+
+    if adv["clock"]["period"] >= 4 and adv["clock"]["remaining"] <= 150:
+        close_game = abs(adv["current_margin_home"]) <= 8
+        foul_environment = adv["combined_fouls"] >= 26 or adv["combined_ft_rate"] >= 25
+
+        if not close_game and not foul_environment:
+            reasons.append("late_game_no_foul_edge")
+
+    return {
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+    }
+
+
+def is_dead_game(basic, adv):
+    clock = adv["clock"]
+    margin = abs(basic["home_score"] - basic["away_score"])
+
+    if clock["period"] >= 4 and clock["remaining"] <= DEAD_GAME_Q4_SECONDS and margin >= DEAD_GAME_Q4_LEAD:
+        return True
+
+    return False
+
+
+# =========================
+# MODEL / SCENARIOS
+# =========================
+
+def project_total(opening_total, live_total, adv):
+    if opening_total is None or live_total is None:
         return None
 
     simple = adv["projected_total_simple"]
-    pace_adj = (adv["projected_possessions"] - 78) * 1.15
+    pace_component = opening_total + ((adv["projected_possessions"] - 78) * 1.0)
+    foul_component = 3 if adv["combined_ft_rate"] >= 28 or adv["combined_fouls"] >= 28 else 0
+    tov_component = -3 if adv["combined_tov"] >= 20 else 0
 
-    efficiency_adj = 0
-
-    if adv["combined_efg"] < 43:
-        efficiency_adj += 6
-    elif adv["combined_efg"] > 57:
-        efficiency_adj -= 6
-
-    if adv["combined_3p"] < 27:
-        efficiency_adj += 4
-    elif adv["combined_3p"] > 45:
-        efficiency_adj -= 4
-
-    foul_adj = 0
-
-    if adv["combined_ft_rate"] >= 28:
-        foul_adj += 4
-
-    if adv["combined_fouls"] >= 28:
-        foul_adj += 3
-
-    turnover_adj = 0
-
-    if adv["combined_tov"] >= 20:
-        turnover_adj -= 4
-    elif adv["combined_tov"] <= 10:
-        turnover_adj += 2
-
-    rebound_adj = 3 if adv["combined_orb"] >= 12 else 0
-    transition_adj = 3 if adv["combined_fast_break"] >= 16 else 0
-
-    model_component = opening + pace_adj + efficiency_adj + foul_adj + turnover_adj + rebound_adj + transition_adj
-
-    if simple > 0:
-        projected = (opening * 0.45) + (simple * 0.35) + (model_component * 0.20)
-    else:
-        projected = model_component
+    projected = (
+        (opening_total * 0.45)
+        + (simple * 0.35)
+        + ((pace_component + foul_component + tov_component) * 0.20)
+    )
 
     return round(projected, 1)
 
 
-def total_scores(opening, live, adv, projected_total):
-    if opening is None or live is None or projected_total is None:
-        return 0, 0, None
+def project_home_margin(opening_home_spread, adv):
+    if opening_home_spread is None:
+        return None
 
-    edge = round(projected_total - live, 1)
-
-    over_score = round(
-        market_over_pressure(opening, live) * 0.22
-        + pace_score(adv) * 0.20
-        + shooting_over_score(adv) * 0.20
-        + foul_total_score(adv) * 0.16
-        + min(adv["combined_orb"] * 3, 50) * 0.10
-        + min(adv["combined_fast_break"] * 2.5, 50) * 0.07
-        + max(0, 30 - adv["combined_tov"]) * 0.05
-    )
-
-    under_score = round(
-        market_under_pressure(opening, live) * 0.25
-        + slow_down_score(adv) * 0.22
-        + shooting_under_score(adv) * 0.20
-        + min(adv["combined_tov"] * 3, 60) * 0.13
-        + max(0, 25 - adv["combined_ft_rate"]) * 0.10
-        + max(0, 14 - adv["combined_orb"]) * 0.10
-    )
-
-    if edge >= TOTAL_EDGE_TRIGGER:
-        over_score += 8
-
-    if edge <= -TOTAL_EDGE_TRIGGER:
-        under_score += 8
-
-    return clamp(over_score), clamp(under_score), edge
-
-
-def spread_market_edge(opening_home_spread, live_home_spread):
-    if opening_home_spread is None or live_home_spread is None:
-        return 0
-    return abs(live_home_spread - opening_home_spread)
-
-
-def project_home_margin(opening_home_spread, live_home_spread, adv):
     current_margin = adv["current_margin_home"]
     remaining_frac = adv["clock"]["remaining"] / 2400 if adv["clock"]["remaining"] else 0
 
     h = adv["home_stats"]
     a = adv["away_stats"]
 
-    home_eff_edge = (adv["home_ppp"] - adv["away_ppp"]) * 18
-    efg_edge = (h["efg"] - a["efg"]) * 0.18
-    reb_edge = (h["orb"] - a["orb"]) * 0.25
-    tov_edge = (a["tov"] - h["tov"]) * 0.35
-    foul_edge = (a["fouls"] - h["fouls"]) * 0.20
-    transition_edge = (h["fast_break"] - a["fast_break"]) * 0.18
+    pregame_margin = -opening_home_spread
 
-    live_component = current_margin + (
-        home_eff_edge
-        + efg_edge
-        + reb_edge
-        + tov_edge
-        + foul_edge
-        + transition_edge
+    live_damage = (
+        ((adv["home_ppp"] - adv["away_ppp"]) * 10)
+        + ((h["efg"] - a["efg"]) * 0.08)
+        + ((h["orb"] - a["orb"]) * 0.12)
+        + ((a["tov"] - h["tov"]) * 0.20)
+        + ((a["fouls"] - h["fouls"]) * 0.10)
     ) * remaining_frac
 
-    if opening_home_spread is not None:
-        market_component = -opening_home_spread
-        projected = live_component * 0.55 + market_component * 0.45
-    else:
-        projected = live_component
+    projected = (current_margin + live_damage) * 0.60 + pregame_margin * 0.40
 
     return round(projected, 1)
 
 
-def spread_scores(opening_home_spread, live_home_spread, adv, projected_home_margin):
-    if live_home_spread is None or projected_home_margin is None:
-        return 0, 0, None, None
-
-    market_implied_home_margin = -live_home_spread
-    home_edge = round(projected_home_margin - market_implied_home_margin, 1)
-    away_edge = round(-home_edge, 1)
-
-    market_swing = spread_market_edge(opening_home_spread, live_home_spread)
+def classify_scenarios(opening_total, live_total, opening_home_spread, live_home_spread, adv):
+    scenarios = []
 
     h = adv["home_stats"]
     a = adv["away_stats"]
 
-    home_recovery = 0
-    away_recovery = 0
+    market_spread_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
+    market_total_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
 
-    if h["three_pct"] < 28 and h["efg"] < 46:
-        home_recovery += 20
+    if market_spread_move >= SPREAD_MARKET_MOVE_TRIGGER:
+        scenarios.append("large_spread_market_move")
 
-    if a["three_pct"] < 28 and a["efg"] < 46:
-        away_recovery += 20
+    if market_total_move >= TOTAL_MARKET_MOVE_TRIGGER:
+        scenarios.append("large_total_market_move")
 
-    if h["orb"] > a["orb"]:
-        home_recovery += 10
+    if adv["combined_efg"] <= 43 and adv["projected_possessions"] >= 74:
+        scenarios.append("cold_shooting_with_playable_pace")
 
-    if a["orb"] > h["orb"]:
-        away_recovery += 10
+    if adv["combined_3p"] <= 27 and (h["3pa"] + a["3pa"]) >= 16:
+        scenarios.append("three_point_cold_variance")
 
-    if h["tov"] < a["tov"]:
-        home_recovery += 10
+    if adv["combined_efg"] >= 57 or adv["combined_3p"] >= 44:
+        scenarios.append("hot_shooting_possible_regression")
 
-    if a["tov"] < h["tov"]:
-        away_recovery += 10
+    if adv["combined_tov"] >= 20:
+        scenarios.append("turnover_drag")
 
-    if adv["home_player"]["foul_trouble"]:
-        away_recovery += 15
+    if adv["combined_ft_rate"] >= 28 or adv["combined_fouls"] >= 28:
+        scenarios.append("foul_free_throw_environment")
 
-    if adv["away_player"]["foul_trouble"]:
-        home_recovery += 15
+    if adv["projected_possessions"] <= 70:
+        scenarios.append("true_slow_pace")
 
-    home_score = round(
-        min(abs(home_edge) * 9, 55)
-        + min(market_swing * 4, 24)
-        + home_recovery * 0.35
-        + pace_score(adv) * 0.08
-    )
+    if adv["possessions_remaining"] <= 12:
+        scenarios.append("low_possessions_remaining")
 
-    away_score = round(
-        min(abs(away_edge) * 9, 55)
-        + min(market_swing * 4, 24)
-        + away_recovery * 0.35
-        + pace_score(adv) * 0.08
-    )
+    if adv["home_player"]["foul_trouble"] or adv["away_player"]["foul_trouble"]:
+        scenarios.append("star_or_rotation_foul_trouble")
 
-    return clamp(home_score), clamp(away_score), home_edge, away_edge
+    if adv["home_player"]["cold_high_usage"] or adv["away_player"]["cold_high_usage"]:
+        scenarios.append("high_usage_cold_shooting")
+
+    if adv["home_player"]["hot"] or adv["away_player"]["hot"]:
+        scenarios.append("hot_player_variance")
+
+    return scenarios
 
 
-def price_ok(price):
-    if price is None:
-        return True
+def market_inefficiency_score(edge, market_move, scenarios):
+    score = 0
 
-    try:
-        return -130 <= int(price) <= 115
-    except Exception:
-        return True
+    score += min(abs(edge) * 8, 40)
+    score += min(market_move * 3, 25)
 
+    positive_scenarios = {
+        "cold_shooting_with_playable_pace": 10,
+        "three_point_cold_variance": 8,
+        "large_spread_market_move": 8,
+        "large_total_market_move": 8,
+        "foul_free_throw_environment": 6,
+        "high_usage_cold_shooting": 6,
+        "hot_shooting_possible_regression": 8,
+    }
+
+    negative_scenarios = {
+        "true_slow_pace": -8,
+        "turnover_drag": -6,
+        "low_possessions_remaining": -12,
+        "star_or_rotation_foul_trouble": -5,
+    }
+
+    for s in scenarios:
+        score += positive_scenarios.get(s, 0)
+        score += negative_scenarios.get(s, 0)
+
+    return clamp(round(score))
+
+
+def scenario_label(scenarios, play_type):
+    if play_type in ["spread", "moneyline"]:
+        if "cold_shooting_with_playable_pace" in scenarios or "three_point_cold_variance" in scenarios:
+            return "Market may be overreacting to cold shooting"
+
+        if "hot_shooting_possible_regression" in scenarios:
+            return "Market may be overreacting to opponent hot shooting"
+
+        if "large_spread_market_move" in scenarios:
+            return "Large spread move may be bigger than actual game damage"
+
+    if play_type == "over":
+        if "cold_shooting_with_playable_pace" in scenarios:
+            return "Live total may be too low because of poor shooting variance"
+
+        if "foul_free_throw_environment" in scenarios:
+            return "Foul and free throw environment supports scoring"
+
+    if play_type == "under":
+        if "hot_shooting_possible_regression" in scenarios:
+            return "Live total may be too high because of hot shooting"
+
+        if "true_slow_pace" in scenarios:
+            return "Live total may be too high for the possession pace"
+
+    return "Market move may be larger than basketball reality"
+
+
+# =========================
+# ALERT FORMATTING
+# =========================
 
 def format_drivers(adv):
     drivers = [
         f"Pace projection: {adv['projected_possessions']} possessions",
+        f"Possessions remaining: {adv['possessions_remaining']}",
         f"Live PPP: {adv['live_ppp']}",
         f"Combined eFG: {adv['combined_efg']}%",
         f"3PT%: {adv['combined_3p']}%",
         f"FT rate: {adv['combined_ft_rate']}%",
         f"Turnovers: {adv['combined_tov']}",
         f"Off rebounds: {adv['combined_orb']}",
+        f"Total rebounds: {adv['combined_reb']}",
         f"Fast-break pts: {adv['combined_fast_break']}",
         f"Fouls: {adv['combined_fouls']}",
     ]
 
     foul_flags = adv["home_player"]["foul_trouble"] + adv["away_player"]["foul_trouble"]
-    abnormal = adv["home_player"]["abnormal"] + adv["away_player"]["abnormal"]
+    cold_flags = adv["home_player"]["cold_high_usage"] + adv["away_player"]["cold_high_usage"]
+    hot_flags = adv["home_player"]["hot"] + adv["away_player"]["hot"]
 
     if foul_flags:
         drivers.append("Foul trouble: " + "; ".join(foul_flags[:3]))
 
-    if abnormal:
-        drivers.append("Abnormal player game: " + "; ".join(abnormal[:3]))
+    if cold_flags:
+        drivers.append("Cold high-usage: " + "; ".join(cold_flags[:3]))
 
-    return "\n".join([f"• {d}" for d in drivers[:12]])
+    if hot_flags:
+        drivers.append("Hot player: " + "; ".join(hot_flags[:3]))
+
+    return "\n".join([f"• {d}" for d in drivers[:14]])
 
 
-def determine_next_sleep(any_live, any_near_strike):
-    if any_near_strike:
-        return FAST_POLL_SECONDS
+def format_scenarios(scenarios):
+    if not scenarios:
+        return "• No major scenario detected"
 
-    if any_live:
-        return ACTIVE_POLL_SECONDS
+    pretty = {
+        "large_spread_market_move": "Large spread market move",
+        "large_total_market_move": "Large total market move",
+        "cold_shooting_with_playable_pace": "Cold shooting with playable pace",
+        "three_point_cold_variance": "Three-point cold variance",
+        "hot_shooting_possible_regression": "Hot shooting possible regression",
+        "turnover_drag": "Turnover drag",
+        "foul_free_throw_environment": "Foul/free throw environment",
+        "true_slow_pace": "True slow pace",
+        "low_possessions_remaining": "Low possessions remaining",
+        "star_or_rotation_foul_trouble": "Star/rotation foul trouble",
+        "high_usage_cold_shooting": "High-usage cold shooting",
+        "hot_player_variance": "Hot player variance",
+    }
 
-    return SLOW_POLL_SECONDS
+    return "\n".join([f"• {pretty.get(s, s)}" for s in scenarios[:8]])
 
+
+def send_market_alert(
+    game_state,
+    alert_key,
+    label,
+    basic,
+    adv,
+    play,
+    price,
+    score,
+    edge,
+    market_move,
+    play_type,
+    risk_note,
+    opening_total,
+    opening_home_spread,
+    opening_home_ml,
+    live_total,
+    live_home_spread,
+    home_ml_price,
+    projected_total,
+    projected_home_margin,
+    scenarios,
+):
+    if not alert_allowed(game_state, alert_key):
+        print(f"ALERT COOLDOWN ACTIVE | {label} | {alert_key}")
+        return
+
+    scenario = scenario_label(scenarios, play_type)
+    scenario_text = format_scenarios(scenarios)
+    drivers = format_drivers(adv)
+    clock = adv["clock"]
+
+    msg = (
+        f"WNBA MARKET INEFFICIENCY STRIKE\n\n"
+        f"{label}\n\n"
+        f"Recommended Play:\n"
+        f"{play}\n\n"
+        f"Price: {price}\n"
+        f"Market Inefficiency Score: {score}/100\n\n"
+        f"Scenario:\n"
+        f"{scenario}\n\n"
+        f"Opening Market:\n"
+        f"Total: {opening_total}\n"
+        f"Home Spread: {opening_home_spread}\n"
+        f"Home ML: {opening_home_ml}\n\n"
+        f"Live Market:\n"
+        f"Total: {live_total}\n"
+        f"Home Spread: {live_home_spread}\n"
+        f"Home ML: {home_ml_price}\n\n"
+        f"Market Move:\n"
+        f"{market_move}\n\n"
+        f"Model Reality Check:\n"
+        f"Projected Total: {projected_total}\n"
+        f"Projected Home Margin: {projected_home_margin}\n"
+        f"Edge: {edge}\n\n"
+        f"Score/Clock:\n"
+        f"{basic['away_score']}-{basic['home_score']} | Q{clock['period']} {clock['clock']}\n\n"
+        f"Detected Scenarios:\n{scenario_text}\n\n"
+        f"Live Drivers:\n{drivers}\n\n"
+        f"Risk:\n"
+        f"{risk_note}\n\n"
+        f"Action:\n"
+        f"Playable only from {MIN_PRICE} to {MAX_PRICE}. Do not chase if the number moves away."
+    )
+
+    send_text(msg)
+    mark_alert_sent(game_state, alert_key)
+
+
+# =========================
+# MAIN LOOP
+# =========================
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
-
     state = load_state()
 
     while True:
-        any_live = False
-        any_near_strike = False
+        next_loop_sleep = SLOW_POLL_SECONDS
 
         try:
             games = get_schedule()
             odds = get_odds()
 
-            print(f"\n--- WNBA SHIFT CHECK {now_local().strftime('%I:%M:%S %p')} ---")
+            print(f"\n--- WNBA SHIFT V3.1 COST CHECK {now_local().strftime('%I:%M:%S %p')} ---")
 
             for event in games:
                 basic = parse_event_basic(event)
@@ -977,23 +1234,32 @@ def main():
                 start_label = start_time.strftime("%I:%M %p AZ") if start_time else "Unknown"
 
                 if event_id not in state["games"]:
-                    state["games"][event_id] = {
-                        "opening_total": None,
-                        "opening_home_spread": None,
-                        "alerts": [],
-                        "started_text_sent": False,
-                        "final_logged": False,
-                    }
+                    state["games"][event_id] = default_game_state()
 
                 game_state = state["games"][event_id]
 
-                if start_time and not should_fetch_summary(start_time):
-                    print(f"DORMANT | {label} | Start {start_label} | Too early")
+                # Per-game throttle. This is one of the biggest cost savers.
+                if should_skip_game_this_loop(game_state):
+                    remaining = game_state["next_allowed_check_ts"] - now_ts()
+                    print(f"SKIP | {label} | Next check in {remaining}s")
+                    next_loop_sleep = min(next_loop_sleep, max(10, remaining))
                     continue
 
-                summary = get_summary(event_id)
+                if game_state.get("dead_game"):
+                    print(f"DEAD GAME SKIP | {label}")
+                    set_next_check(game_state, basic, near_strike=False)
+                    continue
+
+                if start_time and not should_fetch_summary(start_time):
+                    print(f"DORMANT | {label} | Start {start_label} | Too early")
+                    set_next_check(game_state, basic, near_strike=False)
+                    continue
 
                 odds_data = find_odds(odds, basic["home"], basic["away"])
+                state_type = basic["state"]
+                mode = "ACTIVE" if state_type == "in" else "FINAL" if state_type == "post" else "DORMANT"
+
+                update_openers_if_pregame(game_state, odds_data, state_type)
 
                 live_total = odds_data.get("total")
                 live_home_spread = odds_data.get("home_spread")
@@ -1002,193 +1268,335 @@ def main():
                 under_price = odds_data.get("under_price")
                 home_spread_price = odds_data.get("home_spread_price")
                 away_spread_price = odds_data.get("away_spread_price")
-
-                if game_state["opening_total"] is None and live_total is not None:
-                    game_state["opening_total"] = live_total
-
-                if game_state["opening_home_spread"] is None and live_home_spread is not None:
-                    game_state["opening_home_spread"] = live_home_spread
+                home_ml_price = odds_data.get("home_ml_price")
+                away_ml_price = odds_data.get("away_ml_price")
 
                 opening_total = game_state["opening_total"]
                 opening_home_spread = game_state["opening_home_spread"]
-
-                state_type = basic["state"]
-                mode = "ACTIVE" if state_type == "in" else "FINAL" if state_type == "post" else "DORMANT"
-
-                if state_type == "in":
-                    any_live = True
-
-                    if not game_state["started_text_sent"]:
-                        send_text(
-                            f"WNBA SHIFT STARTED\n\n"
-                            f"{label}\n"
-                            f"Start: {start_label}\n\n"
-                            f"Bot is now active for this game."
-                        )
-                        game_state["started_text_sent"] = True
+                opening_away_spread = game_state["opening_away_spread"]
+                opening_home_ml = game_state["opening_home_ml"]
+                opening_away_ml = game_state["opening_away_ml"]
 
                 if state_type == "post":
                     if not game_state["final_logged"]:
                         print(f"FINAL | {label} | Score {basic['away_score']}-{basic['home_score']}")
                         game_state["final_logged"] = True
 
+                    set_next_check(game_state, basic, near_strike=False)
                     save_state(state)
                     continue
 
                 if state_type != "in":
-                    print(f"{mode} | {label} | Start {start_label}")
+                    print(
+                        f"{mode} | {label} | Start {start_label} | "
+                        f"OpenTotal {opening_total} | OpenHomeSpread {opening_home_spread} | OpenHomeML {opening_home_ml}"
+                    )
+                    record_snapshot(game_state, basic, odds_data)
+                    update_last_market_state(game_state, basic, odds_data)
+                    interval = set_next_check(game_state, basic, near_strike=False)
+                    next_loop_sleep = min(next_loop_sleep, interval)
                     save_state(state)
                     continue
 
+                if not game_state["started_text_sent"]:
+                    send_text(
+                        f"WNBA SHIFT V3.1 STARTED\n\n"
+                        f"{label}\n"
+                        f"Start: {start_label}\n\n"
+                        f"Cost-optimized market inefficiency bot is now active."
+                    )
+                    game_state["started_text_sent"] = True
+
+                changed, change_reason = meaningful_change(game_state, basic, odds_data)
+
+                if not changed:
+                    print(
+                        f"LIGHT SKIP | {label} | No meaningful score/line change | "
+                        f"Score {basic['away_score']}-{basic['home_score']} | "
+                        f"Total {live_total} | HomeSpread {live_home_spread} | HomeML {home_ml_price}"
+                    )
+                    record_snapshot(game_state, basic, odds_data)
+                    interval = set_next_check(game_state, basic, near_strike=False)
+                    next_loop_sleep = min(next_loop_sleep, interval)
+                    save_state(state)
+                    continue
+
+                print(f"HEAVY CHECK | {label} | Reason: {change_reason}")
+
+                # Heavy ESPN summary call only happens here.
+                summary = get_summary(event_id)
                 adv = live_advanced(summary, basic)
+                validation = validate_live_data(odds_data, adv)
+                clock = adv["clock"]
+
+                record_snapshot(game_state, basic, odds_data, clock=clock)
+                update_last_market_state(game_state, basic, odds_data)
+                game_state["last_heavy_check_ts"] = now_ts()
+
+                if is_dead_game(basic, adv):
+                    game_state["dead_game"] = True
+                    print(
+                        f"DEAD GAME MARKED | {label} | "
+                        f"Q{clock['period']} {clock['clock']} | "
+                        f"Score {basic['away_score']}-{basic['home_score']}"
+                    )
+                    set_next_check(game_state, basic, near_strike=False)
+                    save_state(state)
+                    continue
+
+                if not validation["valid"]:
+                    print(
+                        f"DATA INVALID — NO ALERT | {label} | "
+                        f"Q{clock['period']} {clock['clock']} | "
+                        f"Score {basic['away_score']}-{basic['home_score']} | "
+                        f"Reasons: {', '.join(validation['reasons'])} | "
+                        f"FGA {adv['home_stats']['fga'] + adv['away_stats']['fga']} | "
+                        f"Poss {adv['possessions']} | PPP {adv['live_ppp']} | eFG {adv['combined_efg']}"
+                    )
+                    interval = set_next_check(game_state, basic, near_strike=False)
+                    next_loop_sleep = min(next_loop_sleep, interval)
+                    save_state(state)
+                    continue
 
                 projected_total = project_total(opening_total, live_total, adv)
-                over_score, under_score, total_edge = total_scores(opening_total, live_total, adv, projected_total)
+                projected_home_margin = project_home_margin(opening_home_spread, adv)
 
-                projected_home_margin = project_home_margin(opening_home_spread, live_home_spread, adv)
-
-                home_spread_score, away_spread_score, home_edge, away_edge = spread_scores(
+                scenarios = classify_scenarios(
+                    opening_total,
+                    live_total,
                     opening_home_spread,
                     live_home_spread,
                     adv,
-                    projected_home_margin,
                 )
 
-                if total_edge is not None and abs(total_edge) >= TOTAL_EDGE_TRIGGER - 2:
-                    any_near_strike = True
+                total_edge = round(projected_total - live_total, 1) if projected_total is not None and live_total is not None else None
 
-                if home_edge is not None and abs(home_edge) >= SPREAD_EDGE_TRIGGER - 1:
-                    any_near_strike = True
+                home_edge = None
+                away_edge = None
 
-                clock = adv["clock"]
+                if projected_home_margin is not None and live_home_spread is not None:
+                    market_implied_home_margin = -live_home_spread
+                    home_edge = round(projected_home_margin - market_implied_home_margin, 1)
+                    away_edge = round(-home_edge, 1)
+
+                spread_market_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
+                total_market_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
+
+                over_score = market_inefficiency_score(total_edge, total_market_move, scenarios) if total_edge is not None and total_edge >= MIN_TOTAL_EDGE else 0
+                under_score = market_inefficiency_score(total_edge, total_market_move, scenarios) if total_edge is not None and total_edge <= -MIN_TOTAL_EDGE else 0
+
+                home_spread_score = market_inefficiency_score(home_edge, spread_market_move, scenarios) if home_edge is not None and home_edge >= MIN_SPREAD_EDGE else 0
+                away_spread_score = market_inefficiency_score(away_edge, spread_market_move, scenarios) if away_edge is not None and away_edge >= MIN_SPREAD_EDGE else 0
+
+                home_ml_score = 0
+                away_ml_score = 0
+
+                if home_edge is not None and home_edge >= MIN_SPREAD_EDGE + 1 and price_ok(home_ml_price):
+                    home_ml_score = market_inefficiency_score(home_edge, spread_market_move, scenarios)
+
+                if away_edge is not None and away_edge >= MIN_SPREAD_EDGE + 1 and price_ok(away_ml_price):
+                    away_ml_score = market_inefficiency_score(away_edge, spread_market_move, scenarios)
+
+                max_score = max(
+                    over_score,
+                    under_score,
+                    home_spread_score,
+                    away_spread_score,
+                    home_ml_score,
+                    away_ml_score,
+                )
+
+                near_strike = max_score >= MIN_MISPRICING_SCORE - 8
 
                 print(
                     f"{mode} | {label} | Q{clock['period']} {clock['clock']} | "
                     f"Score {basic['away_score']}-{basic['home_score']} | "
-                    f"OpenTotal {opening_total} LiveTotal {live_total} ProjTotal {projected_total} TotalEdge {total_edge} | "
+                    f"OpenTotal {opening_total} LiveTotal {live_total} ProjTotal {projected_total} "
+                    f"TotalEdge {total_edge} TotalMove {total_market_move} | "
                     f"OpenHomeSpread {opening_home_spread} LiveHomeSpread {live_home_spread} "
-                    f"ProjHomeMargin {projected_home_margin} HomeEdge {home_edge} | "
-                    f"Poss {adv['possessions']} ProjPoss {adv['projected_possessions']} PPP {adv['live_ppp']} | "
-                    f"eFG {adv['combined_efg']} 3P {adv['combined_3p']} FT rate {adv['combined_ft_rate']} | "
-                    f"TOV {adv['combined_tov']} ORB {adv['combined_orb']} FB {adv['combined_fast_break']} Fouls {adv['combined_fouls']} | "
-                    f"OVER {over_score}% UNDER {under_score}% "
-                    f"HOME_SPREAD {home_spread_score}% AWAY_SPREAD {away_spread_score}%"
+                    f"ProjHomeMargin {projected_home_margin} HomeEdge {home_edge} AwayEdge {away_edge} "
+                    f"SpreadMove {spread_market_move} | "
+                    f"PossRemain {adv['possessions_remaining']} PPP {adv['live_ppp']} "
+                    f"eFG {adv['combined_efg']} 3P {adv['combined_3p']} "
+                    f"TOV {adv['combined_tov']} Fouls {adv['combined_fouls']} | "
+                    f"Scores O:{over_score} U:{under_score} HS:{home_spread_score} "
+                    f"AS:{away_spread_score} HML:{home_ml_score} AML:{away_ml_score}"
                 )
 
-                alerts = game_state["alerts"]
-                drivers = format_drivers(adv)
+                # ALERTS
 
-                if (
-                    over_score >= MIN_CONFIDENCE
-                    and total_edge is not None
-                    and total_edge >= TOTAL_EDGE_TRIGGER
-                    and live_total is not None
-                    and price_ok(over_price)
-                    and "OVER" not in alerts
-                ):
-                    msg = (
-                        f"WNBA SHIFT STRIKE\n\n"
-                        f"{label}\n\n"
-                        f"PLAY: Over {live_total}\n"
-                        f"Odds: {over_price}\n"
-                        f"Confidence: {over_score}%\n\n"
-                        f"Opening Total: {opening_total}\n"
-                        f"Live Total: {live_total}\n"
-                        f"SHIFT Projected Total: {projected_total}\n"
-                        f"Edge: +{total_edge}\n\n"
-                        f"Score: {basic['away_score']}-{basic['home_score']}\n"
-                        f"Clock: Q{clock['period']} {clock['clock']}\n\n"
-                        f"Drivers:\n{drivers}"
-                    )
-                    send_text(msg)
-                    alerts.append("OVER")
+                if ENABLE_TOTAL_ALERTS and over_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("total", live_total, over_price, adv, odds_data)
+                    if nb["ok"]:
+                        send_market_alert(
+                            game_state,
+                            "OVER",
+                            label,
+                            basic,
+                            adv,
+                            f"Over {live_total}",
+                            over_price,
+                            over_score,
+                            f"+{total_edge}",
+                            f"Total moved {total_market_move} points from open",
+                            "over",
+                            "If pace drops further, turnovers spike, or shooting remains poor, edge can disappear.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
 
-                if (
-                    under_score >= MIN_CONFIDENCE
-                    and total_edge is not None
-                    and total_edge <= -TOTAL_EDGE_TRIGGER
-                    and live_total is not None
-                    and price_ok(under_price)
-                    and "UNDER" not in alerts
-                ):
-                    msg = (
-                        f"WNBA SHIFT STRIKE\n\n"
-                        f"{label}\n\n"
-                        f"PLAY: Under {live_total}\n"
-                        f"Odds: {under_price}\n"
-                        f"Confidence: {under_score}%\n\n"
-                        f"Opening Total: {opening_total}\n"
-                        f"Live Total: {live_total}\n"
-                        f"SHIFT Projected Total: {projected_total}\n"
-                        f"Edge: {total_edge}\n\n"
-                        f"Score: {basic['away_score']}-{basic['home_score']}\n"
-                        f"Clock: Q{clock['period']} {clock['clock']}\n\n"
-                        f"Drivers:\n{drivers}"
-                    )
-                    send_text(msg)
-                    alerts.append("UNDER")
+                if ENABLE_TOTAL_ALERTS and under_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("total", live_total, under_price, adv, odds_data)
+                    if nb["ok"]:
+                        send_market_alert(
+                            game_state,
+                            "UNDER",
+                            label,
+                            basic,
+                            adv,
+                            f"Under {live_total}",
+                            under_price,
+                            under_score,
+                            total_edge,
+                            f"Total moved {total_market_move} points from open",
+                            "under",
+                            "If fouls increase or the game becomes close late, foul scoring can hurt the under.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
 
-                home_spread_value_ok = live_home_spread is not None and live_home_spread >= MIN_LIVE_SPREAD_VALUE
-                away_spread_value_ok = live_away_spread is not None and live_away_spread >= MIN_LIVE_SPREAD_VALUE
+                if ENABLE_SPREAD_ALERTS and home_spread_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("spread", live_home_spread, home_spread_price, adv, odds_data)
+                    if nb["ok"] and live_home_spread is not None and live_home_spread > 0:
+                        send_market_alert(
+                            game_state,
+                            "HOME_SPREAD",
+                            label,
+                            basic,
+                            adv,
+                            f"{basic['home']} +{abs(live_home_spread)}",
+                            home_spread_price,
+                            home_spread_score,
+                            f"+{home_edge}",
+                            f"Home spread moved {spread_market_move} points from open",
+                            "spread",
+                            "If the deficit is structural, not variance, the spread edge is weaker.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
 
-                if (
-                    home_spread_score >= MIN_CONFIDENCE
-                    and home_edge is not None
-                    and home_edge >= SPREAD_EDGE_TRIGGER
-                    and home_spread_value_ok
-                    and price_ok(home_spread_price)
-                    and "HOME_SPREAD" not in alerts
-                ):
-                    msg = (
-                        f"WNBA SPREAD FLIP STRIKE\n\n"
-                        f"{label}\n\n"
-                        f"PLAY: {basic['home']} {live_home_spread}\n"
-                        f"Odds: {home_spread_price}\n"
-                        f"Confidence: {home_spread_score}%\n\n"
-                        f"Opening Home Spread: {opening_home_spread}\n"
-                        f"Live Home Spread: {live_home_spread}\n"
-                        f"Projected Home Margin: {projected_home_margin}\n"
-                        f"Edge: +{home_edge}\n\n"
-                        f"Score: {basic['away_score']}-{basic['home_score']}\n"
-                        f"Clock: Q{clock['period']} {clock['clock']}\n\n"
-                        f"Drivers:\n{drivers}"
-                    )
-                    send_text(msg)
-                    alerts.append("HOME_SPREAD")
+                if ENABLE_SPREAD_ALERTS and away_spread_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("spread", live_away_spread, away_spread_price, adv, odds_data)
+                    if nb["ok"] and live_away_spread is not None and live_away_spread > 0:
+                        send_market_alert(
+                            game_state,
+                            "AWAY_SPREAD",
+                            label,
+                            basic,
+                            adv,
+                            f"{basic['away']} +{abs(live_away_spread)}",
+                            away_spread_price,
+                            away_spread_score,
+                            f"+{away_edge}",
+                            f"Home spread moved {spread_market_move} points from open",
+                            "spread",
+                            "If the deficit is structural, not variance, the spread edge is weaker.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
 
-                if (
-                    away_spread_score >= MIN_CONFIDENCE
-                    and away_edge is not None
-                    and away_edge >= SPREAD_EDGE_TRIGGER
-                    and away_spread_value_ok
-                    and price_ok(away_spread_price)
-                    and "AWAY_SPREAD" not in alerts
-                ):
-                    msg = (
-                        f"WNBA SPREAD FLIP STRIKE\n\n"
-                        f"{label}\n\n"
-                        f"PLAY: {basic['away']} {live_away_spread}\n"
-                        f"Odds: {away_spread_price}\n"
-                        f"Confidence: {away_spread_score}%\n\n"
-                        f"Opening Away Spread: {None if opening_home_spread is None else -opening_home_spread}\n"
-                        f"Live Away Spread: {live_away_spread}\n"
-                        f"Projected Away Margin: {-projected_home_margin if projected_home_margin is not None else None}\n"
-                        f"Edge: +{away_edge}\n\n"
-                        f"Score: {basic['away_score']}-{basic['home_score']}\n"
-                        f"Clock: Q{clock['period']} {clock['clock']}\n\n"
-                        f"Drivers:\n{drivers}"
-                    )
-                    send_text(msg)
-                    alerts.append("AWAY_SPREAD")
+                if ENABLE_MONEYLINE_ALERTS and home_ml_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("moneyline", None, home_ml_price, adv, odds_data)
+                    if nb["ok"]:
+                        send_market_alert(
+                            game_state,
+                            "HOME_ML",
+                            label,
+                            basic,
+                            adv,
+                            f"{basic['home']} Moneyline",
+                            home_ml_price,
+                            home_ml_score,
+                            f"Projected home margin edge +{home_edge}",
+                            f"Home ML shifted from {opening_home_ml} to {home_ml_price}",
+                            "moneyline",
+                            "Moneyline is higher risk than spread; only play if the live number remains inside target range.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
 
+                if ENABLE_MONEYLINE_ALERTS and away_ml_score >= MIN_MISPRICING_SCORE:
+                    nb = no_bet_filter("moneyline", None, away_ml_price, adv, odds_data)
+                    if nb["ok"]:
+                        send_market_alert(
+                            game_state,
+                            "AWAY_ML",
+                            label,
+                            basic,
+                            adv,
+                            f"{basic['away']} Moneyline",
+                            away_ml_price,
+                            away_ml_score,
+                            f"Projected away margin edge +{away_edge}",
+                            f"Away ML shifted from {opening_away_ml} to {away_ml_price}",
+                            "moneyline",
+                            "Moneyline is higher risk than spread; only play if the live number remains inside target range.",
+                            opening_total,
+                            opening_home_spread,
+                            opening_home_ml,
+                            live_total,
+                            live_home_spread,
+                            home_ml_price,
+                            projected_total,
+                            projected_home_margin,
+                            scenarios,
+                        )
+
+                interval = set_next_check(game_state, basic, near_strike=near_strike)
+                next_loop_sleep = min(next_loop_sleep, interval)
                 save_state(state)
 
         except Exception as e:
             print("ERROR:", repr(e))
 
-        sleep_seconds = determine_next_sleep(any_live, any_near_strike)
-        print(f"Sleeping {sleep_seconds} seconds...\n")
-        time.sleep(sleep_seconds)
+        next_loop_sleep = max(10, min(next_loop_sleep, SLOW_POLL_SECONDS))
+        print(f"Sleeping {next_loop_sleep} seconds...\n")
+        time.sleep(next_loop_sleep)
 
 
 if __name__ == "__main__":
