@@ -1,4 +1,3 @@
-
 import os
 import time
 import json
@@ -13,27 +12,23 @@ from twilio.rest import Client
 load_dotenv()
 
 # =========================
-# WNBA SHIFT V3.1
-# MARKET INEFFICIENCY BOT
-# COST-OPTIMIZED VERSION
+# WNBA SHIFT V3.2
+# PROFESSIONAL RECOMMENDATION BOT
 # =========================
 #
-# Main goal:
-# Find live market inefficiencies between -140 and +100.
+# Goal:
+# Send fewer, better alerts.
 #
-# Cost-saving changes from V3:
-# 1. Does NOT pull ESPN summary every loop unless the game/line changed.
-# 2. Uses per-game sleep timing instead of treating every game the same.
-# 3. Skips heavy model work when market and score are unchanged.
-# 4. Stops monitoring obvious dead/blowout games.
-# 5. Uses alert cooldowns to avoid repeated reprocessing/spam.
-# 6. Pulls full markets in one odds call, but avoids summary/model calls unless needed.
+# Alert types:
+# 1. START alert when game goes live
+# 2. WATCHLIST alert when a game is close to a recommendation
+# 3. STRIKE alert when the bot has a playable recommendation
 #
-# Expected API/runtime reduction:
-# Usually 50-70% fewer heavy summary/model cycles.
+# This version is less restrictive than V3.1 but not spammy.
+# It only sends the best recommendation per check.
 
 TZ = ZoneInfo("America/Phoenix")
-STATE_FILE = "wnba_shift_state_v31_cost_optimized.json"
+STATE_FILE = "wnba_shift_state_v32_professional.json"
 
 ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
@@ -43,52 +38,46 @@ ALERT_TO_NUMBER = os.getenv("ALERT_TO_NUMBER", "")
 
 SPORT_KEY = "basketball_wnba"
 
-# Global sleep bounds
 SLOW_POLL_SECONDS = int(os.getenv("SLOW_POLL_SECONDS", "300"))
 PREGAME_POLL_SECONDS = int(os.getenv("PREGAME_POLL_SECONDS", "180"))
 ACTIVE_POLL_SECONDS = int(os.getenv("ACTIVE_POLL_SECONDS", "60"))
-FAST_POLL_SECONDS = int(os.getenv("FAST_POLL_SECONDS", "20"))
-LATE_FAST_POLL_SECONDS = int(os.getenv("LATE_FAST_POLL_SECONDS", "15"))
+FAST_POLL_SECONDS = int(os.getenv("FAST_POLL_SECONDS", "25"))
 
 PREGAME_WINDOW_MINUTES = int(os.getenv("PREGAME_WINDOW_MINUTES", "75"))
 
-# Playable price range
 MIN_PRICE = int(os.getenv("MIN_PRICE", "-140"))
 MAX_PRICE = int(os.getenv("MAX_PRICE", "100"))
 
-# Data validation
-MIN_ELAPSED_SECONDS = int(os.getenv("MIN_ELAPSED_SECONDS", "480"))
-MIN_VALID_FGA = int(os.getenv("MIN_VALID_FGA", "32"))
-MIN_VALID_POSSESSIONS = float(os.getenv("MIN_VALID_POSSESSIONS", "18"))
-MAX_VALID_PPP = float(os.getenv("MAX_VALID_PPP", "1.75"))
+# Less restrictive than old version
+MIN_ELAPSED_SECONDS = int(os.getenv("MIN_ELAPSED_SECONDS", "240"))
+MIN_VALID_FGA = int(os.getenv("MIN_VALID_FGA", "20"))
+MIN_VALID_POSSESSIONS = float(os.getenv("MIN_VALID_POSSESSIONS", "10"))
+MAX_VALID_PPP = float(os.getenv("MAX_VALID_PPP", "1.85"))
 
-# Market trigger thresholds
-SPREAD_MARKET_MOVE_TRIGGER = float(os.getenv("SPREAD_MARKET_MOVE_TRIGGER", "6.0"))
-TOTAL_MARKET_MOVE_TRIGGER = float(os.getenv("TOTAL_MARKET_MOVE_TRIGGER", "7.0"))
-MIN_SPREAD_EDGE = float(os.getenv("MIN_SPREAD_EDGE", "4.0"))
-MIN_TOTAL_EDGE = float(os.getenv("MIN_TOTAL_EDGE", "5.5"))
-MIN_MISPRICING_SCORE = int(os.getenv("MIN_MISPRICING_SCORE", "70"))
+MIN_TOTAL_EDGE = float(os.getenv("MIN_TOTAL_EDGE", "3.5"))
+MIN_SPREAD_EDGE = float(os.getenv("MIN_SPREAD_EDGE", "3.0"))
 
-# Skip/reprocess thresholds
+WATCHLIST_SCORE = int(os.getenv("WATCHLIST_SCORE", "50"))
+STRIKE_SCORE = int(os.getenv("STRIKE_SCORE", "58"))
+
+MAX_ALERTS_PER_GAME = int(os.getenv("MAX_ALERTS_PER_GAME", "3"))
+WATCHLIST_COOLDOWN_SECONDS = int(os.getenv("WATCHLIST_COOLDOWN_SECONDS", "900"))
+STRIKE_COOLDOWN_SECONDS = int(os.getenv("STRIKE_COOLDOWN_SECONDS", "600"))
+
 MIN_SCORE_CHANGE_TO_REMODEL = int(os.getenv("MIN_SCORE_CHANGE_TO_REMODEL", "2"))
-MIN_TOTAL_CHANGE_TO_REMODEL = float(os.getenv("MIN_TOTAL_CHANGE_TO_REMODEL", "1.5"))
+MIN_TOTAL_CHANGE_TO_REMODEL = float(os.getenv("MIN_TOTAL_CHANGE_TO_REMODEL", "1.0"))
 MIN_SPREAD_CHANGE_TO_REMODEL = float(os.getenv("MIN_SPREAD_CHANGE_TO_REMODEL", "1.0"))
 MIN_ML_CHANGE_TO_REMODEL = int(os.getenv("MIN_ML_CHANGE_TO_REMODEL", "20"))
 
-# No-bet filters
+MIN_POSSESSIONS_REMAINING = float(os.getenv("MIN_POSSESSIONS_REMAINING", "6"))
 MAX_SPREAD_PLAY = float(os.getenv("MAX_SPREAD_PLAY", "14.5"))
-MIN_POSSESSIONS_REMAINING = float(os.getenv("MIN_POSSESSIONS_REMAINING", "8"))
 
-# Dead-game filters
 DEAD_GAME_Q4_LEAD = int(os.getenv("DEAD_GAME_Q4_LEAD", "22"))
 DEAD_GAME_Q4_SECONDS = int(os.getenv("DEAD_GAME_Q4_SECONDS", "240"))
 
-# Cooldowns
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "300"))
-
-ENABLE_TOTAL_ALERTS = os.getenv("ENABLE_TOTAL_ALERTS", "true").lower() == "true"
-ENABLE_SPREAD_ALERTS = os.getenv("ENABLE_SPREAD_ALERTS", "true").lower() == "true"
-ENABLE_MONEYLINE_ALERTS = os.getenv("ENABLE_MONEYLINE_ALERTS", "true").lower() == "true"
+ENABLE_START_ALERTS = os.getenv("ENABLE_START_ALERTS", "true").lower() == "true"
+ENABLE_WATCHLIST_ALERTS = os.getenv("ENABLE_WATCHLIST_ALERTS", "true").lower() == "true"
+ENABLE_STRIKE_ALERTS = os.getenv("ENABLE_STRIKE_ALERTS", "true").lower() == "true"
 
 TEAM_ALIASES = {
     "las vegas aces": "aces",
@@ -106,10 +95,6 @@ TEAM_ALIASES = {
     "golden state valkyries": "valkyries",
 }
 
-
-# =========================
-# BASIC HELPERS
-# =========================
 
 def now_local():
     return datetime.now(TZ)
@@ -178,51 +163,43 @@ def parse_clock_to_seconds(clock):
 
 def price_ok(price):
     price = safe_int(price, None)
-    if price is None:
-        return False
-    return MIN_PRICE <= price <= MAX_PRICE
+    return price is not None and MIN_PRICE <= price <= MAX_PRICE
 
-
-def line_changed(prev, current, threshold):
-    if prev is None or current is None:
-        return True
-    try:
-        return abs(float(current) - float(prev)) >= threshold
-    except Exception:
-        return True
-
-
-def ml_changed(prev, current, threshold):
-    if prev is None or current is None:
-        return True
-    try:
-        return abs(int(current) - int(prev)) >= threshold
-    except Exception:
-        return True
-
-
-# =========================
-# TEXT / HEALTH
-# =========================
 
 def send_text(msg):
     print("\n" + msg + "\n")
 
-    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, ALERT_TO_NUMBER]):
-        print("TEXT NOT SENT: Missing Twilio variables.")
-        return
+    missing = []
+    if not TWILIO_ACCOUNT_SID:
+        missing.append("TWILIO_ACCOUNT_SID")
+    if not TWILIO_AUTH_TOKEN:
+        missing.append("TWILIO_AUTH_TOKEN")
+    if not TWILIO_FROM_NUMBER:
+        missing.append("TWILIO_FROM_NUMBER")
+    if not ALERT_TO_NUMBER:
+        missing.append("ALERT_TO_NUMBER")
+
+    if missing:
+        print("TEXT NOT SENT. Missing:", ", ".join(missing))
+        return False
 
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(body=msg, from_=TWILIO_FROM_NUMBER, to=ALERT_TO_NUMBER)
+        client.messages.create(
+            body=msg,
+            from_=TWILIO_FROM_NUMBER,
+            to=ALERT_TO_NUMBER,
+        )
         print("TEXT SENT SUCCESSFULLY")
+        return True
     except Exception as e:
         print("TEXT ERROR:", repr(e))
+        return False
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"WNBA SHIFT V3.1 COST-OPTIMIZED MARKET INEFFICIENCY BOT RUNNING"
+        body = b"WNBA SHIFT V3.2 PROFESSIONAL BOT RUNNING"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -236,10 +213,6 @@ def start_health_server():
     print(f"Health server running on port {port}")
     server.serve_forever()
 
-
-# =========================
-# STATE
-# =========================
 
 def default_game_state():
     return {
@@ -258,17 +231,16 @@ def default_game_state():
         "last_home_score": None,
         "last_away_score": None,
 
-        "last_heavy_check_ts": 0,
-        "last_light_check_ts": 0,
-        "next_allowed_check_ts": 0,
-
-        "line_snapshots": [],
-        "alerts": [],
-        "alert_times": {},
-
         "started_text_sent": False,
         "final_logged": False,
         "dead_game": False,
+
+        "next_allowed_check_ts": 0,
+        "last_watchlist_ts": 0,
+        "last_strike_ts": 0,
+
+        "alerts_sent": [],
+        "line_snapshots": [],
     }
 
 
@@ -292,10 +264,6 @@ def save_state(state):
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
-
-# =========================
-# API CALLS
-# =========================
 
 def get_schedule():
     url = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
@@ -335,7 +303,6 @@ def get_odds():
 
     try:
         r = requests.get(url, params=params, timeout=15)
-
         if r.status_code != 200:
             print("ODDS API ERROR:", r.status_code, r.text)
             return []
@@ -343,15 +310,10 @@ def get_odds():
         data = r.json()
         print(f"ODDS EVENTS RETURNED: {len(data)}")
         return data
-
     except Exception as e:
         print("ODDS ERROR:", repr(e))
         return []
 
-
-# =========================
-# SCHEDULE / ODDS PARSING
-# =========================
 
 def parse_start_time(event):
     raw = event.get("date")
@@ -367,7 +329,6 @@ def parse_start_time(event):
 def should_fetch_summary(start_time):
     if not start_time:
         return True
-
     minutes_until = (start_time - now_local()).total_seconds() / 60
     return minutes_until <= PREGAME_WINDOW_MINUTES
 
@@ -439,11 +400,9 @@ def find_odds(odds_events, home, away):
                 elif key == "spreads":
                     for out in market.get("outcomes", []):
                         name = clean_team(out.get("name"))
-
                         if name == ch:
                             result["home_spread"] = out.get("point")
                             result["home_spread_price"] = out.get("price")
-
                         if name == ca:
                             result["away_spread"] = out.get("point")
                             result["away_spread_price"] = out.get("price")
@@ -451,10 +410,8 @@ def find_odds(odds_events, home, away):
                 elif key == "h2h":
                     for out in market.get("outcomes", []):
                         name = clean_team(out.get("name"))
-
                         if name == ch:
                             result["home_ml_price"] = out.get("price")
-
                         if name == ca:
                             result["away_ml_price"] = out.get("price")
 
@@ -463,10 +420,6 @@ def find_odds(odds_events, home, away):
     print(f"NO ODDS MATCH FOR: {away} at {home}")
     return {"matched": False, "book_count": 0}
 
-
-# =========================
-# BOX SCORE / ADVANCED DATA
-# =========================
 
 def map_stat_key(name):
     k = name.lower().replace(" ", "_").replace("-", "_")
@@ -551,7 +504,6 @@ def team_stats_from_summary(summary):
 
     for t in box.get("teams", []):
         side = t.get("homeAway")
-
         if side not in ["home", "away"]:
             continue
 
@@ -582,7 +534,6 @@ def player_stats_from_summary(summary):
 
     for team in box.get("players", []):
         side = team.get("homeAway")
-
         if side not in ["home", "away"]:
             continue
 
@@ -592,7 +543,6 @@ def player_stats_from_summary(summary):
             for athlete in group.get("athletes", []):
                 person = athlete.get("athlete", {})
                 values = athlete.get("stats", [])
-
                 row = {"name": person.get("displayName", "Unknown")}
 
                 for i, label in enumerate(labels):
@@ -619,24 +569,14 @@ def player_impact(players):
         fgm = safe_float(p.get("fgm"), None)
         fouls = safe_float(p.get("pf", p.get("fouls", 0)), 0)
         turnovers = safe_float(p.get("to", p.get("turnovers", 0)), 0)
-        mins_raw = p.get("min", p.get("minutes", "0"))
-
-        if isinstance(mins_raw, str) and ":" in mins_raw:
-            minutes = safe_float(mins_raw.split(":")[0], 0)
-        else:
-            minutes = safe_float(mins_raw, 0)
 
         if fouls >= 4:
             impact["foul_trouble"].append(f"{name}: {int(fouls)} fouls")
-        elif fouls >= 3 and minutes <= 24:
-            impact["foul_trouble"].append(f"{name}: {int(fouls)} early fouls")
 
         if fga >= 8 and fgm is not None:
             fg_pct = fgm / fga if fga else 0
-
             if fg_pct <= 0.30:
                 impact["cold_high_usage"].append(f"{name}: {int(fgm)}/{int(fga)} shooting")
-
             if fg_pct >= 0.65 and pts >= 12:
                 impact["hot"].append(f"{name}: {int(fgm)}/{int(fga)} shooting")
 
@@ -693,15 +633,12 @@ def live_advanced(summary, basic):
     poss = estimate_possessions(h, a)
     game_fraction = max(clock["game_fraction"], 0.01)
 
-    projected_possessions = clamp(poss / game_fraction if poss > 0 else 0, 60, 95)
-
     total_points = basic["home_score"] + basic["away_score"]
     current_margin_home = basic["home_score"] - basic["away_score"]
 
     live_ppp = total_points / poss if poss else 0
-
-    seconds_remaining = clock["remaining"]
-    possessions_remaining = max(0, (seconds_remaining / 2400) * projected_possessions)
+    projected_possessions = clamp(poss / game_fraction if poss > 0 else 0, 60, 95)
+    possessions_remaining = max(0, (clock["remaining"] / 2400) * projected_possessions)
 
     return {
         "clock": clock,
@@ -727,10 +664,6 @@ def live_advanced(summary, basic):
         "combined_fouls": h["fouls"] + a["fouls"],
     }
 
-
-# =========================
-# COST OPTIMIZATION
-# =========================
 
 def update_openers_if_pregame(game_state, odds_data, state_type):
     if state_type == "in":
@@ -761,13 +694,13 @@ def meaningful_change(game_state, basic, odds_data):
     if abs(score_sum - game_state.get("last_score_sum", 0)) >= MIN_SCORE_CHANGE_TO_REMODEL:
         return True, "score_changed"
 
-    if line_changed(game_state.get("last_total"), odds_data.get("total"), MIN_TOTAL_CHANGE_TO_REMODEL):
+    if abs(safe_float(odds_data.get("total"), 0) - safe_float(game_state.get("last_total"), 0)) >= MIN_TOTAL_CHANGE_TO_REMODEL:
         return True, "total_changed"
 
-    if line_changed(game_state.get("last_home_spread"), odds_data.get("home_spread"), MIN_SPREAD_CHANGE_TO_REMODEL):
+    if abs(safe_float(odds_data.get("home_spread"), 0) - safe_float(game_state.get("last_home_spread"), 0)) >= MIN_SPREAD_CHANGE_TO_REMODEL:
         return True, "spread_changed"
 
-    if ml_changed(game_state.get("last_home_ml"), odds_data.get("home_ml_price"), MIN_ML_CHANGE_TO_REMODEL):
+    if abs(safe_int(odds_data.get("home_ml_price"), 0) - safe_int(game_state.get("last_home_ml"), 0)) >= MIN_ML_CHANGE_TO_REMODEL:
         return True, "moneyline_changed"
 
     return False, "unchanged"
@@ -801,59 +734,6 @@ def record_snapshot(game_state, basic, odds_data, clock=None):
     game_state["line_snapshots"] = game_state["line_snapshots"][-20:]
 
 
-def game_interval_seconds(basic, game_state, near_strike=False):
-    if game_state.get("dead_game"):
-        return SLOW_POLL_SECONDS
-
-    start_time = basic.get("start_time")
-    state_type = basic.get("state")
-
-    if state_type != "in":
-        if not start_time:
-            return SLOW_POLL_SECONDS
-
-        minutes_until = (start_time - now_local()).total_seconds() / 60
-
-        if minutes_until > PREGAME_WINDOW_MINUTES:
-            return SLOW_POLL_SECONDS
-
-        return PREGAME_POLL_SECONDS
-
-    if near_strike:
-        return FAST_POLL_SECONDS
-
-    return ACTIVE_POLL_SECONDS
-
-
-def should_skip_game_this_loop(game_state):
-    return now_ts() < game_state.get("next_allowed_check_ts", 0)
-
-
-def set_next_check(game_state, basic, near_strike=False):
-    interval = game_interval_seconds(basic, game_state, near_strike)
-    game_state["next_allowed_check_ts"] = now_ts() + interval
-    return interval
-
-
-def alert_allowed(game_state, alert_key):
-    last = game_state.get("alert_times", {}).get(alert_key)
-    if last is None:
-        return True
-    return now_ts() - int(last) >= ALERT_COOLDOWN_SECONDS
-
-
-def mark_alert_sent(game_state, alert_key):
-    if "alert_times" not in game_state:
-        game_state["alert_times"] = {}
-    game_state["alert_times"][alert_key] = now_ts()
-    if alert_key not in game_state["alerts"]:
-        game_state["alerts"].append(alert_key)
-
-
-# =========================
-# VALIDATION / FILTERS
-# =========================
-
 def validate_live_data(odds_data, adv):
     reasons = []
 
@@ -864,7 +744,7 @@ def validate_live_data(odds_data, adv):
         reasons.append("no_bookmakers")
 
     if adv["clock"]["elapsed"] < MIN_ELAPSED_SECONDS:
-        reasons.append("too_early")
+        reasons.append("early_but_monitoring")
 
     h = adv["home_stats"]
     a = adv["away_stats"]
@@ -872,67 +752,24 @@ def validate_live_data(odds_data, adv):
     combined_fga = h["fga"] + a["fga"]
 
     if combined_fga < MIN_VALID_FGA:
-        reasons.append(f"bad_or_missing_fga:{combined_fga}")
+        reasons.append(f"low_fga:{combined_fga}")
 
     if adv["possessions"] < MIN_VALID_POSSESSIONS:
-        reasons.append(f"bad_possessions:{adv['possessions']}")
+        reasons.append(f"low_possessions:{adv['possessions']}")
 
     if adv["live_ppp"] <= 0 or adv["live_ppp"] > MAX_VALID_PPP:
-        reasons.append(f"impossible_ppp:{adv['live_ppp']}")
+        reasons.append(f"bad_ppp:{adv['live_ppp']}")
 
-    if adv["combined_efg"] == 0:
-        reasons.append("zero_efg")
+    hard_invalid = [
+        r for r in reasons
+        if not r.startswith("early_but_monitoring")
+    ]
 
     return {
-        "valid": len(reasons) == 0,
+        "valid": len(hard_invalid) == 0,
         "reasons": reasons,
     }
 
-
-def no_bet_filter(market_type, line, price, adv, odds_data):
-    reasons = []
-
-    if not price_ok(price):
-        reasons.append(f"price_outside_range:{price}")
-
-    if adv["possessions_remaining"] < MIN_POSSESSIONS_REMAINING:
-        reasons.append(f"too_few_possessions_left:{adv['possessions_remaining']}")
-
-    if market_type == "spread":
-        if line is None:
-            reasons.append("missing_spread")
-        elif abs(float(line)) > MAX_SPREAD_PLAY:
-            reasons.append(f"spread_too_large:{line}")
-
-    if market_type == "total" and odds_data.get("total") is None:
-        reasons.append("missing_total")
-
-    if adv["clock"]["period"] >= 4 and adv["clock"]["remaining"] <= 150:
-        close_game = abs(adv["current_margin_home"]) <= 8
-        foul_environment = adv["combined_fouls"] >= 26 or adv["combined_ft_rate"] >= 25
-
-        if not close_game and not foul_environment:
-            reasons.append("late_game_no_foul_edge")
-
-    return {
-        "ok": len(reasons) == 0,
-        "reasons": reasons,
-    }
-
-
-def is_dead_game(basic, adv):
-    clock = adv["clock"]
-    margin = abs(basic["home_score"] - basic["away_score"])
-
-    if clock["period"] >= 4 and clock["remaining"] <= DEAD_GAME_Q4_SECONDS and margin >= DEAD_GAME_Q4_LEAD:
-        return True
-
-    return False
-
-
-# =========================
-# MODEL / SCENARIOS
-# =========================
 
 def project_total(opening_total, live_total, adv):
     if opening_total is None or live_total is None:
@@ -941,12 +778,12 @@ def project_total(opening_total, live_total, adv):
     simple = adv["projected_total_simple"]
     pace_component = opening_total + ((adv["projected_possessions"] - 78) * 1.0)
     foul_component = 3 if adv["combined_ft_rate"] >= 28 or adv["combined_fouls"] >= 28 else 0
-    tov_component = -3 if adv["combined_tov"] >= 20 else 0
+    turnover_component = -3 if adv["combined_tov"] >= 20 else 0
 
     projected = (
-        (opening_total * 0.45)
-        + (simple * 0.35)
-        + ((pace_component + foul_component + tov_component) * 0.20)
+        (opening_total * 0.42)
+        + (simple * 0.38)
+        + ((pace_component + foul_component + turnover_component) * 0.20)
     )
 
     return round(projected, 1)
@@ -983,38 +820,38 @@ def classify_scenarios(opening_total, live_total, opening_home_spread, live_home
     h = adv["home_stats"]
     a = adv["away_stats"]
 
-    market_spread_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
-    market_total_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
+    total_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
+    spread_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
 
-    if market_spread_move >= SPREAD_MARKET_MOVE_TRIGGER:
-        scenarios.append("large_spread_market_move")
-
-    if market_total_move >= TOTAL_MARKET_MOVE_TRIGGER:
+    if total_move >= 5:
         scenarios.append("large_total_market_move")
 
-    if adv["combined_efg"] <= 43 and adv["projected_possessions"] >= 74:
-        scenarios.append("cold_shooting_with_playable_pace")
+    if spread_move >= 4:
+        scenarios.append("large_spread_market_move")
 
-    if adv["combined_3p"] <= 27 and (h["3pa"] + a["3pa"]) >= 16:
+    if adv["combined_efg"] <= 44 and adv["projected_possessions"] >= 74:
+        scenarios.append("cold_shooting_playable_pace")
+
+    if adv["combined_3p"] <= 28 and (h["3pa"] + a["3pa"]) >= 14:
         scenarios.append("three_point_cold_variance")
 
     if adv["combined_efg"] >= 57 or adv["combined_3p"] >= 44:
-        scenarios.append("hot_shooting_possible_regression")
-
-    if adv["combined_tov"] >= 20:
-        scenarios.append("turnover_drag")
+        scenarios.append("hot_shooting_regression_risk")
 
     if adv["combined_ft_rate"] >= 28 or adv["combined_fouls"] >= 28:
         scenarios.append("foul_free_throw_environment")
 
+    if adv["combined_tov"] >= 20:
+        scenarios.append("turnover_drag")
+
     if adv["projected_possessions"] <= 70:
         scenarios.append("true_slow_pace")
 
-    if adv["possessions_remaining"] <= 12:
+    if adv["possessions_remaining"] <= 10:
         scenarios.append("low_possessions_remaining")
 
     if adv["home_player"]["foul_trouble"] or adv["away_player"]["foul_trouble"]:
-        scenarios.append("star_or_rotation_foul_trouble")
+        scenarios.append("foul_trouble")
 
     if adv["home_player"]["cold_high_usage"] or adv["away_player"]["cold_high_usage"]:
         scenarios.append("high_usage_cold_shooting")
@@ -1025,69 +862,103 @@ def classify_scenarios(opening_total, live_total, opening_home_spread, live_home
     return scenarios
 
 
-def market_inefficiency_score(edge, market_move, scenarios):
+def market_score(edge, market_move, scenarios, play_type):
     score = 0
 
-    score += min(abs(edge) * 8, 40)
-    score += min(market_move * 3, 25)
+    score += min(abs(edge) * 9, 42)
+    score += min(market_move * 3, 22)
 
-    positive_scenarios = {
-        "cold_shooting_with_playable_pace": 10,
-        "three_point_cold_variance": 8,
-        "large_spread_market_move": 8,
-        "large_total_market_move": 8,
-        "foul_free_throw_environment": 6,
-        "high_usage_cold_shooting": 6,
-        "hot_shooting_possible_regression": 8,
+    positive = {
+        "large_total_market_move": 7,
+        "large_spread_market_move": 7,
+        "cold_shooting_playable_pace": 9,
+        "three_point_cold_variance": 7,
+        "foul_free_throw_environment": 7,
+        "high_usage_cold_shooting": 5,
+        "hot_shooting_regression_risk": 8,
     }
 
-    negative_scenarios = {
+    negative = {
         "true_slow_pace": -8,
-        "turnover_drag": -6,
-        "low_possessions_remaining": -12,
-        "star_or_rotation_foul_trouble": -5,
+        "turnover_drag": -5,
+        "low_possessions_remaining": -10,
+        "foul_trouble": -3,
     }
 
     for s in scenarios:
-        score += positive_scenarios.get(s, 0)
-        score += negative_scenarios.get(s, 0)
+        score += positive.get(s, 0)
+        score += negative.get(s, 0)
+
+    if play_type == "over":
+        if "true_slow_pace" in scenarios:
+            score -= 8
+        if "foul_free_throw_environment" in scenarios:
+            score += 5
+
+    if play_type == "under":
+        if "foul_free_throw_environment" in scenarios:
+            score -= 8
+        if "hot_shooting_regression_risk" in scenarios:
+            score += 5
 
     return clamp(round(score))
 
 
-def scenario_label(scenarios, play_type):
-    if play_type in ["spread", "moneyline"]:
-        if "cold_shooting_with_playable_pace" in scenarios or "three_point_cold_variance" in scenarios:
-            return "Market may be overreacting to cold shooting"
+def no_bet_filter(candidate, adv):
+    reasons = []
 
-        if "hot_shooting_possible_regression" in scenarios:
-            return "Market may be overreacting to opponent hot shooting"
+    if not price_ok(candidate["price"]):
+        reasons.append(f"price_outside_range:{candidate['price']}")
 
-        if "large_spread_market_move" in scenarios:
-            return "Large spread move may be bigger than actual game damage"
+    if adv["possessions_remaining"] < MIN_POSSESSIONS_REMAINING:
+        reasons.append(f"too_few_possessions_left:{adv['possessions_remaining']}")
 
-    if play_type == "over":
-        if "cold_shooting_with_playable_pace" in scenarios:
-            return "Live total may be too low because of poor shooting variance"
+    if candidate["market"] == "spread":
+        if candidate["line"] is None:
+            reasons.append("missing_spread")
+        elif abs(float(candidate["line"])) > MAX_SPREAD_PLAY:
+            reasons.append(f"spread_too_large:{candidate['line']}")
 
-        if "foul_free_throw_environment" in scenarios:
-            return "Foul and free throw environment supports scoring"
+    if candidate["market"] == "total":
+        if candidate["line"] is None:
+            reasons.append("missing_total")
 
-    if play_type == "under":
-        if "hot_shooting_possible_regression" in scenarios:
-            return "Live total may be too high because of hot shooting"
+    if adv["clock"]["period"] >= 4 and adv["clock"]["remaining"] <= 150:
+        close_game = abs(adv["current_margin_home"]) <= 8
+        foul_environment = adv["combined_fouls"] >= 26 or adv["combined_ft_rate"] >= 25
 
-        if "true_slow_pace" in scenarios:
-            return "Live total may be too high for the possession pace"
+        if not close_game and not foul_environment:
+            reasons.append("late_game_no_foul_edge")
 
-    return "Market move may be larger than basketball reality"
+    return {
+        "ok": len(reasons) == 0,
+        "reasons": reasons,
+    }
 
 
-# =========================
-# ALERT FORMATTING
-# =========================
+def scenario_text(scenarios):
+    pretty = {
+        "large_total_market_move": "Large live total move",
+        "large_spread_market_move": "Large live spread move",
+        "cold_shooting_playable_pace": "Cold shooting but pace is still playable",
+        "three_point_cold_variance": "Poor 3PT shooting may regress",
+        "hot_shooting_regression_risk": "Hot shooting may cool off",
+        "foul_free_throw_environment": "Foul and free throw environment",
+        "turnover_drag": "Turnovers are dragging scoring",
+        "true_slow_pace": "True slow pace",
+        "low_possessions_remaining": "Limited possessions left",
+        "foul_trouble": "Key foul trouble",
+        "high_usage_cold_shooting": "High-usage players shooting cold",
+        "hot_player_variance": "Hot player variance",
+    }
 
-def format_drivers(adv):
+    if not scenarios:
+        return "• No major scenario detected"
+
+    return "\n".join([f"• {pretty.get(s, s)}" for s in scenarios[:7]])
+
+
+def driver_text(adv):
     drivers = [
         f"Pace projection: {adv['projected_possessions']} possessions",
         f"Possessions remaining: {adv['possessions_remaining']}",
@@ -1096,10 +967,9 @@ def format_drivers(adv):
         f"3PT%: {adv['combined_3p']}%",
         f"FT rate: {adv['combined_ft_rate']}%",
         f"Turnovers: {adv['combined_tov']}",
-        f"Off rebounds: {adv['combined_orb']}",
-        f"Total rebounds: {adv['combined_reb']}",
-        f"Fast-break pts: {adv['combined_fast_break']}",
         f"Fouls: {adv['combined_fouls']}",
+        f"Off rebounds: {adv['combined_orb']}",
+        f"Fast-break points: {adv['combined_fast_break']}",
     ]
 
     foul_flags = adv["home_player"]["foul_trouble"] + adv["away_player"]["foul_trouble"]
@@ -1108,113 +978,305 @@ def format_drivers(adv):
 
     if foul_flags:
         drivers.append("Foul trouble: " + "; ".join(foul_flags[:3]))
-
     if cold_flags:
         drivers.append("Cold high-usage: " + "; ".join(cold_flags[:3]))
-
     if hot_flags:
         drivers.append("Hot player: " + "; ".join(hot_flags[:3]))
 
-    return "\n".join([f"• {d}" for d in drivers[:14]])
+    return "\n".join([f"• {d}" for d in drivers[:12]])
 
 
-def format_scenarios(scenarios):
-    if not scenarios:
-        return "• No major scenario detected"
+def recommendation_reason(candidate, scenarios):
+    if candidate["play_type"] == "over":
+        if "cold_shooting_playable_pace" in scenarios:
+            return "The market may have pushed the total too low because of cold shooting, but pace still supports scoring."
+        if "foul_free_throw_environment" in scenarios:
+            return "The foul and free throw environment supports late scoring."
+        return "Projected total is meaningfully above the live number."
 
-    pretty = {
-        "large_spread_market_move": "Large spread market move",
-        "large_total_market_move": "Large total market move",
-        "cold_shooting_with_playable_pace": "Cold shooting with playable pace",
-        "three_point_cold_variance": "Three-point cold variance",
-        "hot_shooting_possible_regression": "Hot shooting possible regression",
-        "turnover_drag": "Turnover drag",
-        "foul_free_throw_environment": "Foul/free throw environment",
-        "true_slow_pace": "True slow pace",
-        "low_possessions_remaining": "Low possessions remaining",
-        "star_or_rotation_foul_trouble": "Star/rotation foul trouble",
-        "high_usage_cold_shooting": "High-usage cold shooting",
-        "hot_player_variance": "Hot player variance",
-    }
+    if candidate["play_type"] == "under":
+        if "hot_shooting_regression_risk" in scenarios:
+            return "The market may have pushed the total too high because of hot shooting variance."
+        if "true_slow_pace" in scenarios:
+            return "The live total looks high compared to actual possession pace."
+        return "Projected total is meaningfully below the live number."
 
-    return "\n".join([f"• {pretty.get(s, s)}" for s in scenarios[:8]])
+    if candidate["play_type"] in ["home_spread", "away_spread"]:
+        return "The spread appears to have moved farther than the actual game damage supports."
+
+    if candidate["play_type"] in ["home_ml", "away_ml"]:
+        return "Moneyline price appears playable compared with projected margin, but this is higher risk than spread."
+
+    return "Market price may be inefficient compared with live game conditions."
 
 
-def send_market_alert(
-    game_state,
-    alert_key,
-    label,
-    basic,
-    adv,
-    play,
-    price,
-    score,
-    edge,
-    market_move,
-    play_type,
-    risk_note,
-    opening_total,
-    opening_home_spread,
-    opening_home_ml,
-    live_total,
-    live_home_spread,
-    home_ml_price,
-    projected_total,
-    projected_home_margin,
-    scenarios,
-):
-    if not alert_allowed(game_state, alert_key):
-        print(f"ALERT COOLDOWN ACTIVE | {label} | {alert_key}")
-        return
+def build_candidates(basic, odds_data, adv, projections, scenarios):
+    candidates = []
 
-    scenario = scenario_label(scenarios, play_type)
-    scenario_text = format_scenarios(scenarios)
-    drivers = format_drivers(adv)
+    live_total = odds_data.get("total")
+    live_home_spread = odds_data.get("home_spread")
+    live_away_spread = odds_data.get("away_spread")
+
+    opening_total = projections["opening_total"]
+    opening_home_spread = projections["opening_home_spread"]
+
+    projected_total = projections["projected_total"]
+    projected_home_margin = projections["projected_home_margin"]
+
+    total_edge = None
+    if projected_total is not None and live_total is not None:
+        total_edge = round(projected_total - live_total, 1)
+
+    home_edge = None
+    away_edge = None
+    if projected_home_margin is not None and live_home_spread is not None:
+        market_home_margin = -live_home_spread
+        home_edge = round(projected_home_margin - market_home_margin, 1)
+        away_edge = round(-home_edge, 1)
+
+    total_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
+    spread_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
+
+    if total_edge is not None and total_edge >= MIN_TOTAL_EDGE:
+        candidates.append({
+            "play_type": "over",
+            "market": "total",
+            "play": f"Over {live_total}",
+            "line": live_total,
+            "price": odds_data.get("over_price"),
+            "edge": total_edge,
+            "market_move": total_move,
+            "score": market_score(total_edge, total_move, scenarios, "over"),
+        })
+
+    if total_edge is not None and total_edge <= -MIN_TOTAL_EDGE:
+        candidates.append({
+            "play_type": "under",
+            "market": "total",
+            "play": f"Under {live_total}",
+            "line": live_total,
+            "price": odds_data.get("under_price"),
+            "edge": total_edge,
+            "market_move": total_move,
+            "score": market_score(total_edge, total_move, scenarios, "under"),
+        })
+
+    if home_edge is not None and home_edge >= MIN_SPREAD_EDGE:
+        candidates.append({
+            "play_type": "home_spread",
+            "market": "spread",
+            "play": f"{basic['home']} {live_home_spread:+}",
+            "line": live_home_spread,
+            "price": odds_data.get("home_spread_price"),
+            "edge": home_edge,
+            "market_move": spread_move,
+            "score": market_score(home_edge, spread_move, scenarios, "spread"),
+        })
+
+    if away_edge is not None and away_edge >= MIN_SPREAD_EDGE:
+        candidates.append({
+            "play_type": "away_spread",
+            "market": "spread",
+            "play": f"{basic['away']} {live_away_spread:+}",
+            "line": live_away_spread,
+            "price": odds_data.get("away_spread_price"),
+            "edge": away_edge,
+            "market_move": spread_move,
+            "score": market_score(away_edge, spread_move, scenarios, "spread"),
+        })
+
+    if home_edge is not None and home_edge >= MIN_SPREAD_EDGE + 1:
+        candidates.append({
+            "play_type": "home_ml",
+            "market": "moneyline",
+            "play": f"{basic['home']} Moneyline",
+            "line": None,
+            "price": odds_data.get("home_ml_price"),
+            "edge": home_edge,
+            "market_move": spread_move,
+            "score": market_score(home_edge, spread_move, scenarios, "moneyline"),
+        })
+
+    if away_edge is not None and away_edge >= MIN_SPREAD_EDGE + 1:
+        candidates.append({
+            "play_type": "away_ml",
+            "market": "moneyline",
+            "play": f"{basic['away']} Moneyline",
+            "line": None,
+            "price": odds_data.get("away_ml_price"),
+            "edge": away_edge,
+            "market_move": spread_move,
+            "score": market_score(away_edge, spread_move, scenarios, "moneyline"),
+        })
+
+    playable = []
+
+    for c in candidates:
+        nb = no_bet_filter(c, adv)
+        c["no_bet_reasons"] = nb["reasons"]
+        c["playable"] = nb["ok"]
+        if nb["ok"]:
+            playable.append(c)
+
+    playable.sort(key=lambda x: x["score"], reverse=True)
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    return playable, candidates
+
+
+def can_send_watchlist(game_state):
+    if not ENABLE_WATCHLIST_ALERTS:
+        return False
+
+    if len(game_state.get("alerts_sent", [])) >= MAX_ALERTS_PER_GAME:
+        return False
+
+    return now_ts() - int(game_state.get("last_watchlist_ts", 0)) >= WATCHLIST_COOLDOWN_SECONDS
+
+
+def can_send_strike(game_state, alert_key):
+    if not ENABLE_STRIKE_ALERTS:
+        return False
+
+    if len(game_state.get("alerts_sent", [])) >= MAX_ALERTS_PER_GAME:
+        return False
+
+    if alert_key in game_state.get("alerts_sent", []):
+        return False
+
+    return now_ts() - int(game_state.get("last_strike_ts", 0)) >= STRIKE_COOLDOWN_SECONDS
+
+
+def mark_alert(game_state, alert_key, alert_type):
+    if alert_key not in game_state["alerts_sent"]:
+        game_state["alerts_sent"].append(alert_key)
+
+    if alert_type == "watchlist":
+        game_state["last_watchlist_ts"] = now_ts()
+
+    if alert_type == "strike":
+        game_state["last_strike_ts"] = now_ts()
+
+
+def send_watchlist(game_state, label, basic, adv, best, projections, scenarios):
     clock = adv["clock"]
+
+    msg = (
+        f"WNBA SHIFT WATCHLIST\n\n"
+        f"{label}\n\n"
+        f"Close to a recommendation, but not a full strike yet.\n\n"
+        f"Best Lean:\n"
+        f"{best['play']}\n\n"
+        f"Price: {best['price']}\n"
+        f"Score: {best['score']}/100\n"
+        f"Edge: {best['edge']}\n\n"
+        f"Score/Clock:\n"
+        f"{basic['away_score']}-{basic['home_score']} | Q{clock['period']} {clock['clock']}\n\n"
+        f"Market:\n"
+        f"Live Total: {projections['live_total']}\n"
+        f"Projected Total: {projections['projected_total']}\n"
+        f"Live Home Spread: {projections['live_home_spread']}\n"
+        f"Projected Home Margin: {projections['projected_home_margin']}\n\n"
+        f"Why it is close:\n"
+        f"{recommendation_reason(best, scenarios)}\n\n"
+        f"Scenarios:\n"
+        f"{scenario_text(scenarios)}\n\n"
+        f"Action:\n"
+        f"Monitor only. Full strike sends at {STRIKE_SCORE}+."
+    )
+
+    send_text(msg)
+    mark_alert(game_state, "WATCHLIST", "watchlist")
+
+
+def send_strike(game_state, label, basic, adv, best, projections, scenarios):
+    clock = adv["clock"]
+    alert_key = f"STRIKE_{best['play_type']}"
 
     msg = (
         f"WNBA MARKET INEFFICIENCY STRIKE\n\n"
         f"{label}\n\n"
         f"Recommended Play:\n"
-        f"{play}\n\n"
-        f"Price: {price}\n"
-        f"Market Inefficiency Score: {score}/100\n\n"
-        f"Scenario:\n"
-        f"{scenario}\n\n"
-        f"Opening Market:\n"
-        f"Total: {opening_total}\n"
-        f"Home Spread: {opening_home_spread}\n"
-        f"Home ML: {opening_home_ml}\n\n"
-        f"Live Market:\n"
-        f"Total: {live_total}\n"
-        f"Home Spread: {live_home_spread}\n"
-        f"Home ML: {home_ml_price}\n\n"
-        f"Market Move:\n"
-        f"{market_move}\n\n"
-        f"Model Reality Check:\n"
-        f"Projected Total: {projected_total}\n"
-        f"Projected Home Margin: {projected_home_margin}\n"
-        f"Edge: {edge}\n\n"
+        f"{best['play']}\n\n"
+        f"Price: {best['price']}\n"
+        f"Score: {best['score']}/100\n"
+        f"Edge: {best['edge']}\n\n"
         f"Score/Clock:\n"
         f"{basic['away_score']}-{basic['home_score']} | Q{clock['period']} {clock['clock']}\n\n"
-        f"Detected Scenarios:\n{scenario_text}\n\n"
-        f"Live Drivers:\n{drivers}\n\n"
-        f"Risk:\n"
-        f"{risk_note}\n\n"
+        f"Opening Market:\n"
+        f"Total: {projections['opening_total']}\n"
+        f"Home Spread: {projections['opening_home_spread']}\n"
+        f"Home ML: {projections['opening_home_ml']}\n\n"
+        f"Live Market:\n"
+        f"Total: {projections['live_total']}\n"
+        f"Home Spread: {projections['live_home_spread']}\n"
+        f"Home ML: {projections['home_ml_price']}\n\n"
+        f"Model Reality Check:\n"
+        f"Projected Total: {projections['projected_total']}\n"
+        f"Projected Home Margin: {projections['projected_home_margin']}\n\n"
+        f"Why:\n"
+        f"{recommendation_reason(best, scenarios)}\n\n"
+        f"Scenarios:\n"
+        f"{scenario_text(scenarios)}\n\n"
+        f"Drivers:\n"
+        f"{driver_text(adv)}\n\n"
         f"Action:\n"
-        f"Playable only from {MIN_PRICE} to {MAX_PRICE}. Do not chase if the number moves away."
+        f"Playable only from {MIN_PRICE} to {MAX_PRICE}. Do not chase if the price or number moves away."
     )
 
     send_text(msg)
-    mark_alert_sent(game_state, alert_key)
+    mark_alert(game_state, alert_key, "strike")
 
 
-# =========================
-# MAIN LOOP
-# =========================
+def is_dead_game(basic, adv):
+    clock = adv["clock"]
+    margin = abs(basic["home_score"] - basic["away_score"])
+
+    return clock["period"] >= 4 and clock["remaining"] <= DEAD_GAME_Q4_SECONDS and margin >= DEAD_GAME_Q4_LEAD
+
+
+def game_interval_seconds(basic, game_state, near=False):
+    if game_state.get("dead_game"):
+        return SLOW_POLL_SECONDS
+
+    state_type = basic.get("state")
+    start_time = basic.get("start_time")
+
+    if state_type != "in":
+        if not start_time:
+            return SLOW_POLL_SECONDS
+
+        minutes_until = (start_time - now_local()).total_seconds() / 60
+
+        if minutes_until > PREGAME_WINDOW_MINUTES:
+            return SLOW_POLL_SECONDS
+
+        return PREGAME_POLL_SECONDS
+
+    if near:
+        return FAST_POLL_SECONDS
+
+    return ACTIVE_POLL_SECONDS
+
+
+def should_skip_game_this_loop(game_state):
+    return now_ts() < game_state.get("next_allowed_check_ts", 0)
+
+
+def set_next_check(game_state, basic, near=False):
+    interval = game_interval_seconds(basic, game_state, near)
+    game_state["next_allowed_check_ts"] = now_ts() + interval
+    return interval
+
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
+
+    print("WNBA SHIFT V3.2 PROFESSIONAL BOT STARTING")
+    print(f"Price range: {MIN_PRICE} to {MAX_PRICE}")
+    print(f"Watchlist score: {WATCHLIST_SCORE}")
+    print(f"Strike score: {STRIKE_SCORE}")
+
     state = load_state()
 
     while True:
@@ -1224,7 +1286,7 @@ def main():
             games = get_schedule()
             odds = get_odds()
 
-            print(f"\n--- WNBA SHIFT V3.1 COST CHECK {now_local().strftime('%I:%M:%S %p')} ---")
+            print(f"\n--- WNBA SHIFT V3.2 CHECK {now_local().strftime('%I:%M:%S %p')} ---")
 
             for event in games:
                 basic = parse_event_basic(event)
@@ -1238,7 +1300,6 @@ def main():
 
                 game_state = state["games"][event_id]
 
-                # Per-game throttle. This is one of the biggest cost savers.
                 if should_skip_game_this_loop(game_state):
                     remaining = game_state["next_allowed_check_ts"] - now_ts()
                     print(f"SKIP | {label} | Next check in {remaining}s")
@@ -1247,63 +1308,52 @@ def main():
 
                 if game_state.get("dead_game"):
                     print(f"DEAD GAME SKIP | {label}")
-                    set_next_check(game_state, basic, near_strike=False)
+                    interval = set_next_check(game_state, basic)
+                    next_loop_sleep = min(next_loop_sleep, interval)
                     continue
 
                 if start_time and not should_fetch_summary(start_time):
-                    print(f"DORMANT | {label} | Start {start_label} | Too early")
-                    set_next_check(game_state, basic, near_strike=False)
+                    print(f"DORMANT | {label} | Start {start_label}")
+                    interval = set_next_check(game_state, basic)
+                    next_loop_sleep = min(next_loop_sleep, interval)
                     continue
 
                 odds_data = find_odds(odds, basic["home"], basic["away"])
                 state_type = basic["state"]
-                mode = "ACTIVE" if state_type == "in" else "FINAL" if state_type == "post" else "DORMANT"
 
                 update_openers_if_pregame(game_state, odds_data, state_type)
 
-                live_total = odds_data.get("total")
-                live_home_spread = odds_data.get("home_spread")
-                live_away_spread = odds_data.get("away_spread")
-                over_price = odds_data.get("over_price")
-                under_price = odds_data.get("under_price")
-                home_spread_price = odds_data.get("home_spread_price")
-                away_spread_price = odds_data.get("away_spread_price")
-                home_ml_price = odds_data.get("home_ml_price")
-                away_ml_price = odds_data.get("away_ml_price")
-
                 opening_total = game_state["opening_total"]
                 opening_home_spread = game_state["opening_home_spread"]
-                opening_away_spread = game_state["opening_away_spread"]
                 opening_home_ml = game_state["opening_home_ml"]
-                opening_away_ml = game_state["opening_away_ml"]
 
                 if state_type == "post":
                     if not game_state["final_logged"]:
                         print(f"FINAL | {label} | Score {basic['away_score']}-{basic['home_score']}")
                         game_state["final_logged"] = True
-
-                    set_next_check(game_state, basic, near_strike=False)
+                    interval = set_next_check(game_state, basic)
+                    next_loop_sleep = min(next_loop_sleep, interval)
                     save_state(state)
                     continue
 
                 if state_type != "in":
                     print(
-                        f"{mode} | {label} | Start {start_label} | "
-                        f"OpenTotal {opening_total} | OpenHomeSpread {opening_home_spread} | OpenHomeML {opening_home_ml}"
+                        f"PREGAME | {label} | Start {start_label} | "
+                        f"OpenTotal {opening_total} | OpenHomeSpread {opening_home_spread}"
                     )
                     record_snapshot(game_state, basic, odds_data)
                     update_last_market_state(game_state, basic, odds_data)
-                    interval = set_next_check(game_state, basic, near_strike=False)
+                    interval = set_next_check(game_state, basic)
                     next_loop_sleep = min(next_loop_sleep, interval)
                     save_state(state)
                     continue
 
-                if not game_state["started_text_sent"]:
+                if ENABLE_START_ALERTS and not game_state["started_text_sent"]:
                     send_text(
-                        f"WNBA SHIFT V3.1 STARTED\n\n"
+                        f"WNBA SHIFT V3.2 STARTED\n\n"
                         f"{label}\n"
                         f"Start: {start_label}\n\n"
-                        f"Cost-optimized market inefficiency bot is now active."
+                        f"Bot is live. It will send WATCHLIST first, then STRIKE only if recommendation strength improves."
                     )
                     game_state["started_text_sent"] = True
 
@@ -1311,52 +1361,49 @@ def main():
 
                 if not changed:
                     print(
-                        f"LIGHT SKIP | {label} | No meaningful score/line change | "
+                        f"LIGHT SKIP | {label} | No meaningful change | "
                         f"Score {basic['away_score']}-{basic['home_score']} | "
-                        f"Total {live_total} | HomeSpread {live_home_spread} | HomeML {home_ml_price}"
+                        f"Total {odds_data.get('total')} | HomeSpread {odds_data.get('home_spread')}"
                     )
                     record_snapshot(game_state, basic, odds_data)
-                    interval = set_next_check(game_state, basic, near_strike=False)
+                    interval = set_next_check(game_state, basic)
                     next_loop_sleep = min(next_loop_sleep, interval)
                     save_state(state)
                     continue
 
                 print(f"HEAVY CHECK | {label} | Reason: {change_reason}")
 
-                # Heavy ESPN summary call only happens here.
                 summary = get_summary(event_id)
                 adv = live_advanced(summary, basic)
-                validation = validate_live_data(odds_data, adv)
                 clock = adv["clock"]
 
-                record_snapshot(game_state, basic, odds_data, clock=clock)
+                record_snapshot(game_state, basic, odds_data, clock)
                 update_last_market_state(game_state, basic, odds_data)
-                game_state["last_heavy_check_ts"] = now_ts()
 
                 if is_dead_game(basic, adv):
                     game_state["dead_game"] = True
-                    print(
-                        f"DEAD GAME MARKED | {label} | "
-                        f"Q{clock['period']} {clock['clock']} | "
-                        f"Score {basic['away_score']}-{basic['home_score']}"
-                    )
-                    set_next_check(game_state, basic, near_strike=False)
-                    save_state(state)
-                    continue
-
-                if not validation["valid"]:
-                    print(
-                        f"DATA INVALID — NO ALERT | {label} | "
-                        f"Q{clock['period']} {clock['clock']} | "
-                        f"Score {basic['away_score']}-{basic['home_score']} | "
-                        f"Reasons: {', '.join(validation['reasons'])} | "
-                        f"FGA {adv['home_stats']['fga'] + adv['away_stats']['fga']} | "
-                        f"Poss {adv['possessions']} | PPP {adv['live_ppp']} | eFG {adv['combined_efg']}"
-                    )
-                    interval = set_next_check(game_state, basic, near_strike=False)
+                    print(f"DEAD GAME MARKED | {label}")
+                    interval = set_next_check(game_state, basic)
                     next_loop_sleep = min(next_loop_sleep, interval)
                     save_state(state)
                     continue
+
+                validation = validate_live_data(odds_data, adv)
+
+                if not validation["valid"]:
+                    print(
+                        f"DATA INVALID | {label} | "
+                        f"Reasons: {', '.join(validation['reasons'])} | "
+                        f"Q{clock['period']} {clock['clock']} | "
+                        f"Score {basic['away_score']}-{basic['home_score']}"
+                    )
+                    interval = set_next_check(game_state, basic)
+                    next_loop_sleep = min(next_loop_sleep, interval)
+                    save_state(state)
+                    continue
+
+                live_total = odds_data.get("total")
+                live_home_spread = odds_data.get("home_spread")
 
                 projected_total = project_total(opening_total, live_total, adv)
                 projected_home_margin = project_home_margin(opening_home_spread, adv)
@@ -1369,230 +1416,66 @@ def main():
                     adv,
                 )
 
-                total_edge = round(projected_total - live_total, 1) if projected_total is not None and live_total is not None else None
+                projections = {
+                    "opening_total": opening_total,
+                    "opening_home_spread": opening_home_spread,
+                    "opening_home_ml": opening_home_ml,
+                    "live_total": live_total,
+                    "live_home_spread": live_home_spread,
+                    "home_ml_price": odds_data.get("home_ml_price"),
+                    "projected_total": projected_total,
+                    "projected_home_margin": projected_home_margin,
+                }
 
-                home_edge = None
-                away_edge = None
-
-                if projected_home_margin is not None and live_home_spread is not None:
-                    market_implied_home_margin = -live_home_spread
-                    home_edge = round(projected_home_margin - market_implied_home_margin, 1)
-                    away_edge = round(-home_edge, 1)
-
-                spread_market_move = abs(live_home_spread - opening_home_spread) if live_home_spread is not None and opening_home_spread is not None else 0
-                total_market_move = abs(live_total - opening_total) if live_total is not None and opening_total is not None else 0
-
-                over_score = market_inefficiency_score(total_edge, total_market_move, scenarios) if total_edge is not None and total_edge >= MIN_TOTAL_EDGE else 0
-                under_score = market_inefficiency_score(total_edge, total_market_move, scenarios) if total_edge is not None and total_edge <= -MIN_TOTAL_EDGE else 0
-
-                home_spread_score = market_inefficiency_score(home_edge, spread_market_move, scenarios) if home_edge is not None and home_edge >= MIN_SPREAD_EDGE else 0
-                away_spread_score = market_inefficiency_score(away_edge, spread_market_move, scenarios) if away_edge is not None and away_edge >= MIN_SPREAD_EDGE else 0
-
-                home_ml_score = 0
-                away_ml_score = 0
-
-                if home_edge is not None and home_edge >= MIN_SPREAD_EDGE + 1 and price_ok(home_ml_price):
-                    home_ml_score = market_inefficiency_score(home_edge, spread_market_move, scenarios)
-
-                if away_edge is not None and away_edge >= MIN_SPREAD_EDGE + 1 and price_ok(away_ml_price):
-                    away_ml_score = market_inefficiency_score(away_edge, spread_market_move, scenarios)
-
-                max_score = max(
-                    over_score,
-                    under_score,
-                    home_spread_score,
-                    away_spread_score,
-                    home_ml_score,
-                    away_ml_score,
+                playable, all_candidates = build_candidates(
+                    basic,
+                    odds_data,
+                    adv,
+                    projections,
+                    scenarios,
                 )
 
-                near_strike = max_score >= MIN_MISPRICING_SCORE - 8
+                best = playable[0] if playable else None
+                best_any = all_candidates[0] if all_candidates else None
+
+                best_score = best["score"] if best else 0
+                near = best_score >= WATCHLIST_SCORE
 
                 print(
-                    f"{mode} | {label} | Q{clock['period']} {clock['clock']} | "
+                    f"ACTIVE | {label} | Q{clock['period']} {clock['clock']} | "
                     f"Score {basic['away_score']}-{basic['home_score']} | "
-                    f"OpenTotal {opening_total} LiveTotal {live_total} ProjTotal {projected_total} "
-                    f"TotalEdge {total_edge} TotalMove {total_market_move} | "
+                    f"OpenTotal {opening_total} LiveTotal {live_total} ProjTotal {projected_total} | "
                     f"OpenHomeSpread {opening_home_spread} LiveHomeSpread {live_home_spread} "
-                    f"ProjHomeMargin {projected_home_margin} HomeEdge {home_edge} AwayEdge {away_edge} "
-                    f"SpreadMove {spread_market_move} | "
-                    f"PossRemain {adv['possessions_remaining']} PPP {adv['live_ppp']} "
-                    f"eFG {adv['combined_efg']} 3P {adv['combined_3p']} "
-                    f"TOV {adv['combined_tov']} Fouls {adv['combined_fouls']} | "
-                    f"Scores O:{over_score} U:{under_score} HS:{home_spread_score} "
-                    f"AS:{away_spread_score} HML:{home_ml_score} AML:{away_ml_score}"
+                    f"ProjHomeMargin {projected_home_margin} | "
+                    f"BestPlayable {best['play'] if best else 'None'} "
+                    f"Score {best_score} | "
+                    f"Scenarios {scenarios}"
                 )
 
-                # ALERTS
+                if best and best["score"] >= STRIKE_SCORE:
+                    alert_key = f"STRIKE_{best['play_type']}"
+                    if can_send_strike(game_state, alert_key):
+                        send_strike(game_state, label, basic, adv, best, projections, scenarios)
 
-                if ENABLE_TOTAL_ALERTS and over_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("total", live_total, over_price, adv, odds_data)
-                    if nb["ok"]:
-                        send_market_alert(
-                            game_state,
-                            "OVER",
-                            label,
-                            basic,
-                            adv,
-                            f"Over {live_total}",
-                            over_price,
-                            over_score,
-                            f"+{total_edge}",
-                            f"Total moved {total_market_move} points from open",
-                            "over",
-                            "If pace drops further, turnovers spike, or shooting remains poor, edge can disappear.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
+                elif best and best["score"] >= WATCHLIST_SCORE:
+                    if can_send_watchlist(game_state):
+                        send_watchlist(game_state, label, basic, adv, best, projections, scenarios)
 
-                if ENABLE_TOTAL_ALERTS and under_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("total", live_total, under_price, adv, odds_data)
-                    if nb["ok"]:
-                        send_market_alert(
-                            game_state,
-                            "UNDER",
-                            label,
-                            basic,
-                            adv,
-                            f"Under {live_total}",
-                            under_price,
-                            under_score,
-                            total_edge,
-                            f"Total moved {total_market_move} points from open",
-                            "under",
-                            "If fouls increase or the game becomes close late, foul scoring can hurt the under.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
+                elif best_any:
+                    print(
+                        f"NO ALERT | {label} | Best candidate {best_any['play']} "
+                        f"Score {best_any['score']} | Playable {best_any['playable']} | "
+                        f"Reasons {best_any.get('no_bet_reasons', [])}"
+                    )
+                else:
+                    print(f"NO EDGE | {label}")
 
-                if ENABLE_SPREAD_ALERTS and home_spread_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("spread", live_home_spread, home_spread_price, adv, odds_data)
-                    if nb["ok"] and live_home_spread is not None and live_home_spread > 0:
-                        send_market_alert(
-                            game_state,
-                            "HOME_SPREAD",
-                            label,
-                            basic,
-                            adv,
-                            f"{basic['home']} +{abs(live_home_spread)}",
-                            home_spread_price,
-                            home_spread_score,
-                            f"+{home_edge}",
-                            f"Home spread moved {spread_market_move} points from open",
-                            "spread",
-                            "If the deficit is structural, not variance, the spread edge is weaker.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
-
-                if ENABLE_SPREAD_ALERTS and away_spread_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("spread", live_away_spread, away_spread_price, adv, odds_data)
-                    if nb["ok"] and live_away_spread is not None and live_away_spread > 0:
-                        send_market_alert(
-                            game_state,
-                            "AWAY_SPREAD",
-                            label,
-                            basic,
-                            adv,
-                            f"{basic['away']} +{abs(live_away_spread)}",
-                            away_spread_price,
-                            away_spread_score,
-                            f"+{away_edge}",
-                            f"Home spread moved {spread_market_move} points from open",
-                            "spread",
-                            "If the deficit is structural, not variance, the spread edge is weaker.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
-
-                if ENABLE_MONEYLINE_ALERTS and home_ml_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("moneyline", None, home_ml_price, adv, odds_data)
-                    if nb["ok"]:
-                        send_market_alert(
-                            game_state,
-                            "HOME_ML",
-                            label,
-                            basic,
-                            adv,
-                            f"{basic['home']} Moneyline",
-                            home_ml_price,
-                            home_ml_score,
-                            f"Projected home margin edge +{home_edge}",
-                            f"Home ML shifted from {opening_home_ml} to {home_ml_price}",
-                            "moneyline",
-                            "Moneyline is higher risk than spread; only play if the live number remains inside target range.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
-
-                if ENABLE_MONEYLINE_ALERTS and away_ml_score >= MIN_MISPRICING_SCORE:
-                    nb = no_bet_filter("moneyline", None, away_ml_price, adv, odds_data)
-                    if nb["ok"]:
-                        send_market_alert(
-                            game_state,
-                            "AWAY_ML",
-                            label,
-                            basic,
-                            adv,
-                            f"{basic['away']} Moneyline",
-                            away_ml_price,
-                            away_ml_score,
-                            f"Projected away margin edge +{away_edge}",
-                            f"Away ML shifted from {opening_away_ml} to {away_ml_price}",
-                            "moneyline",
-                            "Moneyline is higher risk than spread; only play if the live number remains inside target range.",
-                            opening_total,
-                            opening_home_spread,
-                            opening_home_ml,
-                            live_total,
-                            live_home_spread,
-                            home_ml_price,
-                            projected_total,
-                            projected_home_margin,
-                            scenarios,
-                        )
-
-                interval = set_next_check(game_state, basic, near_strike=near_strike)
+                interval = set_next_check(game_state, basic, near=near)
                 next_loop_sleep = min(next_loop_sleep, interval)
                 save_state(state)
 
         except Exception as e:
-            print("ERROR:", repr(e))
+            print("MAIN LOOP ERROR:", repr(e))
 
         next_loop_sleep = max(10, min(next_loop_sleep, SLOW_POLL_SECONDS))
         print(f"Sleeping {next_loop_sleep} seconds...\n")
