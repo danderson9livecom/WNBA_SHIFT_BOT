@@ -57,8 +57,8 @@ load_dotenv()
 # =============================================================================
 # Identity / timezone / files
 # =============================================================================
-APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V1.3.0")
-APP_MODE = "MARKET PREDICTOR + RUN SUSTAINABILITY + FUTURE STATE"
+APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V1.7.0")
+APP_MODE = "PROFIT CONTROLS + SIMPLE RESULT TEXTS + UNIT SUMMARY"
 APP_BUILD_LABEL = f"SHIFT WNBA {APP_VERSION} {APP_MODE}"
 TZ = ZoneInfo("America/Phoenix")
 
@@ -70,6 +70,9 @@ LINE_HISTORY_FILE = os.getenv("WNBA_LINE_HISTORY_FILE", "wnba_line_history.csv")
 CLV_HISTORY_FILE = os.getenv("WNBA_CLV_HISTORY_FILE", "wnba_clv_history.csv")
 DAILY_SUMMARY_FILE = os.getenv("WNBA_DAILY_SUMMARY_FILE", "wnba_daily_summary.csv")
 PROFILE_SUMMARY_FILE = os.getenv("WNBA_PROFILE_SUMMARY_FILE", "wnba_profile_summary.csv")
+PROFILE_RULES_FILE = os.getenv("WNBA_PROFILE_RULES_FILE", "wnba_profile_rules.json")
+MARKET_DISCREPANCY_FILE = os.getenv("WNBA_MARKET_DISCREPANCY_FILE", "wnba_market_discrepancy.csv")
+BANKROLL_TRACKER_FILE = os.getenv("WNBA_BANKROLL_TRACKER_FILE", "wnba_bankroll_tracker.csv")
 
 # =============================================================================
 # Credentials / providers
@@ -127,9 +130,13 @@ ALLOW_TRUE_REVERSAL = os.getenv("WNBA_ALLOW_TRUE_REVERSAL", "true").lower() == "
 # Daily/nightly reporting
 ENABLE_DAILY_LEARNING_REPORT = os.getenv("WNBA_ENABLE_DAILY_LEARNING_REPORT", "true").lower() == "true"
 SEND_DAILY_LEARNING_REPORT_SMS = os.getenv("WNBA_SEND_DAILY_LEARNING_REPORT_SMS", "true").lower() == "true"
+SEND_RESULT_SMS = os.getenv("WNBA_SEND_RESULT_SMS", "true").lower() == "true"
 ENABLE_NIGHTLY_EMAIL_REPORT = os.getenv("WNBA_ENABLE_NIGHTLY_EMAIL_REPORT", "true").lower() == "true"
 DAILY_LEARNING_REPORT_HOUR = int(os.getenv("WNBA_DAILY_LEARNING_REPORT_HOUR", "22"))
 ATTACH_DAILY_CSVS_TO_EMAIL = os.getenv("WNBA_ATTACH_DAILY_CSVS_TO_EMAIL", "true").lower() == "true"
+STARTING_BANKROLL_UNITS = float(os.getenv("WNBA_STARTING_BANKROLL_UNITS", "100.0"))
+SEND_SIMPLE_RESULT_SMS = os.getenv("WNBA_SEND_SIMPLE_RESULT_SMS", "true").lower() == "true"
+SEND_SIMPLE_DAILY_SUMMARY_SMS = os.getenv("WNBA_SEND_SIMPLE_DAILY_SUMMARY_SMS", "true").lower() == "true"
 
 # =============================================================================
 # WNBA model thresholds
@@ -139,20 +146,64 @@ PERIOD_MINUTES = 10.0
 DEFAULT_GAME_POSSESSIONS = float(os.getenv("WNBA_DEFAULT_GAME_POSSESSIONS", "78.0"))
 DEFAULT_POINTS_PER_POSSESSION = float(os.getenv("WNBA_DEFAULT_PPP", "1.02"))
 
+# Wide-net learning mode:
+# Start with broader capture, then use graded units + CLV by profile to tighten.
+WIDE_NET_LEARNING_MODE = os.getenv("WNBA_WIDE_NET_LEARNING_MODE", "true").lower() == "true"
+ENABLE_PROJECTION_REALITY_CAPS = os.getenv("WNBA_ENABLE_PROJECTION_REALITY_CAPS", "true").lower() == "true"
+
+# WNBA reality caps. These stop one hot/cold run from creating fake 25-50 point edges.
+WNBA_MIN_EXPECTED_TEAM_PPP = float(os.getenv("WNBA_MIN_EXPECTED_TEAM_PPP", "0.86"))
+WNBA_MAX_EXPECTED_TEAM_PPP = float(os.getenv("WNBA_MAX_EXPECTED_TEAM_PPP", "1.20"))
+WNBA_MAX_LIVE_TEAM_PPP = float(os.getenv("WNBA_MAX_LIVE_TEAM_PPP", "1.28"))
+WNBA_MIN_LIVE_TEAM_PPP = float(os.getenv("WNBA_MIN_LIVE_TEAM_PPP", "0.78"))
+WNBA_MIN_PROJECTED_POSSESSIONS = float(os.getenv("WNBA_MIN_PROJECTED_POSSESSIONS", "68.0"))
+WNBA_MAX_PROJECTED_POSSESSIONS = float(os.getenv("WNBA_MAX_PROJECTED_POSSESSIONS", "88.0"))
+WNBA_SANITY_EDGE_WARN = float(os.getenv("WNBA_SANITY_EDGE_WARN", "16.0"))
+WNBA_SANITY_EDGE_HARD_CAP = float(os.getenv("WNBA_SANITY_EDGE_HARD_CAP", "24.0"))
+
+# Tiered staking for learning. This is still a recreational decision-support tool.
+UNIT_A_PLUS = float(os.getenv("WNBA_UNIT_A_PLUS", "1.0"))
+UNIT_B = float(os.getenv("WNBA_UNIT_B", "0.5"))
+UNIT_SMALL = float(os.getenv("WNBA_UNIT_SMALL", "0.25"))
+
+# A-grade market-discrepancy controls.
+# These detect whether the user's playable book is stale/off-market versus consensus.
+ENABLE_MARKET_DISCREPANCY_ENGINE = os.getenv("WNBA_ENABLE_MARKET_DISCREPANCY_ENGINE", "true").lower() == "true"
+ENABLE_ADAPTIVE_PROFILE_RULES = os.getenv("WNBA_ENABLE_ADAPTIVE_PROFILE_RULES", "true").lower() == "true"
+STALE_LINE_SECONDS = int(os.getenv("WNBA_STALE_LINE_SECONDS", "180"))
+MARKET_CONSENSUS_MIN_BOOKS = int(os.getenv("WNBA_MARKET_CONSENSUS_MIN_BOOKS", "3"))
+OFF_MARKET_TOTAL_POINTS = float(os.getenv("WNBA_OFF_MARKET_TOTAL_POINTS", "1.5"))
+STRONG_OFF_MARKET_TOTAL_POINTS = float(os.getenv("WNBA_STRONG_OFF_MARKET_TOTAL_POINTS", "2.5"))
+BIG_EDGE_CONSENSUS_REQUIRED = float(os.getenv("WNBA_BIG_EDGE_CONSENSUS_REQUIRED", "12.0"))
+PROFILE_RULE_MIN_SAMPLE = int(os.getenv("WNBA_PROFILE_RULE_MIN_SAMPLE", "6"))
+PROFILE_TIGHTEN_CLV = float(os.getenv("WNBA_PROFILE_TIGHTEN_CLV", "-0.25"))
+PROFILE_TRUST_CLV = float(os.getenv("WNBA_PROFILE_TRUST_CLV", "0.25"))
+
+# V1.6 paid-alert controls: learning can stay wide, but paid texts get stricter.
+SEND_SMALL_LEAN_SMS = os.getenv("WNBA_SEND_SMALL_LEAN_SMS", "false").lower() == "true"
+MIN_PAID_ALERT_TIER = os.getenv("WNBA_MIN_PAID_ALERT_TIER", "B_STRIKE").upper()
+REQUIRE_MARKET_CONFIRMATION_FOR_SMALL = os.getenv("WNBA_REQUIRE_MARKET_CONFIRMATION_FOR_SMALL", "true").lower() == "true"
+BAD_PROFILE_BLOCK_PAID = os.getenv("WNBA_BAD_PROFILE_BLOCK_PAID", "true").lower() == "true"
+SPREAD_OFF_MARKET_POINTS = float(os.getenv("WNBA_SPREAD_OFF_MARKET_POINTS", "1.0"))
+SPREAD_STRONG_OFF_MARKET_POINTS = float(os.getenv("WNBA_SPREAD_STRONG_OFF_MARKET_POINTS", "1.5"))
+SHORT_VELOCITY_WINDOW_SECONDS = int(os.getenv("WNBA_SHORT_VELOCITY_WINDOW_SECONDS", "180"))
+PAID_ALERT_REQUIRE_NON_NEGATIVE_PROFILE = os.getenv("WNBA_PAID_ALERT_REQUIRE_NON_NEGATIVE_PROFILE", "true").lower() == "true"
+
+
 # Total market gates
-MIN_TOTAL_EDGE_POINTS = float(os.getenv("WNBA_MIN_TOTAL_EDGE_POINTS", "4.5"))
-MIN_TOTAL_CONFIDENCE = int(os.getenv("WNBA_MIN_TOTAL_CONFIDENCE", "72"))
-MIN_TOTAL_VALUE_SCORE = int(os.getenv("WNBA_MIN_TOTAL_VALUE_SCORE", "68"))
-MAX_TOTAL_RISK_SCORE = int(os.getenv("WNBA_MAX_TOTAL_RISK_SCORE", "54"))
+MIN_TOTAL_EDGE_POINTS = float(os.getenv("WNBA_MIN_TOTAL_EDGE_POINTS", "3.0"))
+MIN_TOTAL_CONFIDENCE = int(os.getenv("WNBA_MIN_TOTAL_CONFIDENCE", "60"))
+MIN_TOTAL_VALUE_SCORE = int(os.getenv("WNBA_MIN_TOTAL_VALUE_SCORE", "56"))
+MAX_TOTAL_RISK_SCORE = int(os.getenv("WNBA_MAX_TOTAL_RISK_SCORE", "72"))
 
 # Favorite buyback gates
 ENABLE_FAVORITE_BUYBACK = os.getenv("WNBA_ENABLE_FAVORITE_BUYBACK", "true").lower() == "true"
 FAVORITE_BUYBACK_TARGET = float(os.getenv("WNBA_FAVORITE_BUYBACK_TARGET", "4.5"))
 FAVORITE_BUYBACK_MIN_LINE = float(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_LINE", "3.5"))
 FAVORITE_BUYBACK_MAX_LINE = float(os.getenv("WNBA_FAVORITE_BUYBACK_MAX_LINE", "6.5"))
-FAVORITE_BUYBACK_MIN_CONFIDENCE = int(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_CONFIDENCE", "74"))
-FAVORITE_BUYBACK_MIN_VALUE_SCORE = int(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_VALUE_SCORE", "70"))
-FAVORITE_BUYBACK_MAX_RISK = int(os.getenv("WNBA_FAVORITE_BUYBACK_MAX_RISK", "56"))
+FAVORITE_BUYBACK_MIN_CONFIDENCE = int(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_CONFIDENCE", "62"))
+FAVORITE_BUYBACK_MIN_VALUE_SCORE = int(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_VALUE_SCORE", "58"))
+FAVORITE_BUYBACK_MAX_RISK = int(os.getenv("WNBA_FAVORITE_BUYBACK_MAX_RISK", "72"))
 FAVORITE_BUYBACK_MIN_SWING = float(os.getenv("WNBA_FAVORITE_BUYBACK_MIN_SWING", "5.0"))
 
 # Price discipline
@@ -241,8 +292,8 @@ ENABLE_RUN_SUSTAINABILITY = os.getenv("WNBA_ENABLE_RUN_SUSTAINABILITY", "true").
 
 # The bot is no longer just asking, "Can this bet win?"
 # It asks, "Is the current live market failing to price the next 3-8 possessions?"
-MIN_MARKET_MISPRICE_SCORE = int(os.getenv("WNBA_MIN_MARKET_MISPRICE_SCORE", "68"))
-MIN_FUTURE_STATE_SCORE = int(os.getenv("WNBA_MIN_FUTURE_STATE_SCORE", "65"))
+MIN_MARKET_MISPRICE_SCORE = int(os.getenv("WNBA_MIN_MARKET_MISPRICE_SCORE", "55"))
+MIN_FUTURE_STATE_SCORE = int(os.getenv("WNBA_MIN_FUTURE_STATE_SCORE", "50"))
 MIN_RUN_UNSUSTAINABLE_SCORE = int(os.getenv("WNBA_MIN_RUN_UNSUSTAINABLE_SCORE", "62"))
 MIN_ACCELERATION_SCORE = int(os.getenv("WNBA_MIN_ACCELERATION_SCORE", "58"))
 
@@ -303,11 +354,12 @@ def decimal_profit_units(price, stake=1.0):
         return stake * (100.0 / abs(p))
     return stake * (p / 100.0)
 
-def result_units(result, price):
+def result_units(result, price, stake=1.0):
+    stake = safe_float(stake, 1.0)
     if result == "WIN":
-        return round(decimal_profit_units(price), 2)
+        return round(decimal_profit_units(price, stake=stake), 2)
     if result == "LOSS":
-        return -1.0
+        return round(-1.0 * stake, 2)
     return 0.0
 
 def load_json(path, fallback):
@@ -758,11 +810,28 @@ def choose_playable_total(totals):
     ref = playable or [t for t in totals if t["book"] in MARKET_REFERENCE_BOOKS] or totals
     chosen = sorted(ref, key=lambda x: (0 if x["book"] in USER_PLAYABLE_BOOKS else 1, x["book"]))[0]
     points = [t["point"] for t in totals if t.get("point") is not None]
+    market_points = [t["point"] for t in totals if t.get("point") is not None and t.get("book") in MARKET_REFERENCE_BOOKS]
+    market_points = market_points or points
     chosen = dict(chosen)
     chosen["market_avg"] = round(sum(points) / len(points), 2) if points else chosen["point"]
+    chosen["market_consensus_avg"] = round(sum(market_points) / len(market_points), 2) if market_points else chosen["point"]
     chosen["market_high"] = max(points) if points else chosen["point"]
     chosen["market_low"] = min(points) if points else chosen["point"]
     chosen["books"] = len(points)
+    chosen["consensus_books"] = len(market_points)
+    chosen["book_vs_market"] = round(safe_float(chosen.get("point")) - safe_float(chosen.get("market_consensus_avg")), 2)
+    chosen["line_age_seconds"] = line_age_seconds(chosen.get("last_update"))
+
+    # Best available view among playable books only.
+    if playable:
+        over_best = sorted(playable, key=lambda x: (safe_float(x.get("point")), -safe_int(x.get("over_price"), -999)), reverse=False)[0]
+        under_best = sorted(playable, key=lambda x: (-safe_float(x.get("point")), -safe_int(x.get("under_price"), -999)), reverse=False)[0]
+        chosen["playable_over_best_point"] = over_best.get("point")
+        chosen["playable_over_best_book"] = over_best.get("book")
+        chosen["playable_over_best_price"] = over_best.get("over_price")
+        chosen["playable_under_best_point"] = under_best.get("point")
+        chosen["playable_under_best_book"] = under_best.get("book")
+        chosen["playable_under_best_price"] = under_best.get("under_price")
     return chosen
 
 def choose_spread_for_side(markets, side):
@@ -771,7 +840,24 @@ def choose_spread_for_side(markets, side):
         return None
     playable = [x for x in offers if x["book"] in USER_PLAYABLE_BOOKS]
     ref = playable or [x for x in offers if x["book"] in MARKET_REFERENCE_BOOKS] or offers
-    return sorted(ref, key=lambda x: (-x["point"], 0 if x["book"] in USER_PLAYABLE_BOOKS else 1, safe_int(x.get("price"), 999)))[0]
+    chosen = sorted(ref, key=lambda x: (-x["point"], 0 if x["book"] in USER_PLAYABLE_BOOKS else 1, safe_int(x.get("price"), 999)))[0]
+
+    # Consensus view: for spreads, the better number for the bettor is the higher point
+    # when taking a team against the spread (+4.5 is better than +3.5; -2.5 is better than -3.5).
+    points = [safe_float(x.get("point"), None) for x in offers if x.get("point") is not None]
+    points = [x for x in points if x is not None]
+    market_points = [safe_float(x.get("point"), None) for x in offers if x.get("point") is not None and x.get("book") in MARKET_REFERENCE_BOOKS]
+    market_points = [x for x in market_points if x is not None] or points
+    out = dict(chosen)
+    out["market_avg"] = round(sum(points) / len(points), 2) if points else out.get("point")
+    out["market_consensus_avg"] = round(sum(market_points) / len(market_points), 2) if market_points else out.get("point")
+    out["market_high"] = max(points) if points else out.get("point")
+    out["market_low"] = min(points) if points else out.get("point")
+    out["books"] = len(points)
+    out["consensus_books"] = len(market_points)
+    out["book_vs_market"] = round(safe_float(out.get("point")) - safe_float(out.get("market_consensus_avg")), 2)
+    out["line_age_seconds"] = line_age_seconds(out.get("last_update"))
+    return out
 
 def choose_moneyline_for_side(markets, side):
     offers = markets.get("h2h", {}).get(side, []) or []
@@ -858,6 +944,23 @@ def line_velocity(sg):
         for h in reversed(hist[:-1]):
             h_dt = datetime.fromisoformat(h["ts"])
             if (latest_dt - h_dt).total_seconds() >= 600:
+                target = h
+                break
+    except Exception:
+        pass
+    return round(safe_float(latest.get("total")) - safe_float(target.get("total")), 2)
+
+def short_line_velocity(sg):
+    hist = sg.get("line_history", [])
+    if len(hist) < 2:
+        return 0.0
+    latest = hist[-1]
+    target = hist[-2]
+    try:
+        latest_dt = datetime.fromisoformat(latest["ts"])
+        for h in reversed(hist[:-1]):
+            h_dt = datetime.fromisoformat(h["ts"])
+            if (latest_dt - h_dt).total_seconds() >= SHORT_VELOCITY_WINDOW_SECONDS:
                 target = h
                 break
     except Exception:
@@ -1191,9 +1294,13 @@ def market_misprice_score_for_total(info, sg, market_scores, side):
         predicted_line_move = max(0.0, true_gap * TOTAL_POINT_TO_MARKET_MOVE_RATIO)
         accel_support = safe_float(accel.get("accel_score_under"), 45) - 45
 
+    # Wide-net but realistic: do not let a massive model gap automatically mean 100/100.
+    capped_gap = min(true_gap, WNBA_SANITY_EDGE_HARD_CAP)
+    predicted_line_move = min(predicted_line_move, WNBA_SANITY_EDGE_HARD_CAP * TOTAL_POINT_TO_MARKET_MOVE_RATIO)
+
     misprice = 40
-    misprice += true_gap * 5.0
-    misprice += predicted_line_move * 6.0
+    misprice += capped_gap * 4.0
+    misprice += predicted_line_move * 4.5
     misprice += (future_score - 50) * 0.35
     misprice += (ppi - 50) * 0.18
     misprice += accel_support * 0.30
@@ -1289,8 +1396,19 @@ def game_pace(info):
     }
 
 def current_ppp(info, pace):
+    """
+    Returns PER-TEAM points per possession.
+
+    Important WNBA fix:
+    estimate_possessions_from_box returns average team possessions.
+    Total game points divided by average team possessions is combined PPP,
+    which is roughly 2.0. For projection we need per-team PPP, roughly 1.0.
+    """
     current_poss = max(1.0, pace.get("current_possessions", 1.0))
-    return round(safe_float(info.get("total_score")) / current_poss, 3)
+    per_team_ppp = safe_float(info.get("total_score")) / (current_poss * 2.0)
+    if ENABLE_PROJECTION_REALITY_CAPS:
+        per_team_ppp = max(WNBA_MIN_LIVE_TEAM_PPP, min(WNBA_MAX_LIVE_TEAM_PPP, per_team_ppp))
+    return round(per_team_ppp, 3)
 
 def team_box(info, side):
     return (info.get("box", {}) or {}).get(side, {}) or {}
@@ -1330,82 +1448,147 @@ def quarter_profile(info):
         return "Q4_EARLY_LIVE"
     return "Q4_LATE_HIGH_VARIANCE"
 
+def live_weight_by_quarter(info):
+    """
+    WNBA live totals are fragile because a few empty possessions, a timeout,
+    or a bench rotation can kill pace. Trust live stats differently by quarter.
+    """
+    qprof = quarter_profile(info)
+    if qprof == "Q1_EARLY_SAMPLE":
+        return 0.35
+    if qprof == "Q2_FIRST_HALF_PROFILE":
+        return 0.50
+    if qprof == "Q3_ADJUSTMENT_WINDOW":
+        return 0.58
+    if qprof == "Q4_EARLY_LIVE":
+        return 0.48
+    return 0.38
+
+def cap_projected_possessions(value):
+    if not ENABLE_PROJECTION_REALITY_CAPS:
+        return value
+    return max(WNBA_MIN_PROJECTED_POSSESSIONS, min(WNBA_MAX_PROJECTED_POSSESSIONS, value))
+
+def cap_expected_team_ppp(value):
+    if not ENABLE_PROJECTION_REALITY_CAPS:
+        return value
+    return max(WNBA_MIN_EXPECTED_TEAM_PPP, min(WNBA_MAX_EXPECTED_TEAM_PPP, value))
+
+def score_state_adjustment(info, expected_ppp):
+    """
+    WNBA-specific game-state adjustment:
+    - blowouts reduce late pace/quality because of clock, bench, and dead possessions
+    - close late games can add FT points
+    """
+    diff = abs(info.get("home_score", 0) - info.get("away_score", 0))
+    min_left = safe_float(info.get("minutes_remaining"), 0)
+    q = safe_int(info.get("period"), 0)
+
+    late_close_bonus = 0.0
+    if min_left <= 5 and diff <= 6:
+        late_close_bonus = 4.0
+    elif min_left <= 3 and diff <= 10:
+        late_close_bonus = 2.0
+
+    if q >= 4 and diff >= 16:
+        expected_ppp -= 0.045
+    elif q >= 3 and diff >= 22:
+        expected_ppp -= 0.035
+
+    return cap_expected_team_ppp(expected_ppp), late_close_bonus
+
+def sanity_edge_tag(edge):
+    ae = abs(safe_float(edge, 0))
+    if ae >= WNBA_SANITY_EDGE_HARD_CAP:
+        return "HARD_SANITY_CHECK"
+    if ae >= WNBA_SANITY_EDGE_WARN:
+        return "SANITY_CHECK"
+    return "NORMAL_EDGE"
+
+
 def projected_total(info, sg):
     pace = game_pace(info)
     ppp = current_ppp(info, pace)
     eff = efficiency_signals(info)
     ctx = game_context(info)
+    qprof = quarter_profile(info)
 
-    expected_ppp = 0.58 * ppp + 0.42 * DEFAULT_POINTS_PER_POSSESSION
+    live_weight = live_weight_by_quarter(info)
+    baseline_weight = 1.0 - live_weight
 
-    # V1.2 pregame team context: do not let live score fully override team profile.
+    expected_ppp = live_weight * ppp + baseline_weight * DEFAULT_POINTS_PER_POSSESSION
+
+    # Pregame/team style context.
     if ENABLE_TEAM_STRENGTH_CONTEXT:
         if ctx["total_pace_rating"] >= 81:
-            expected_ppp += 0.015
+            expected_ppp += 0.012
         elif ctx["total_pace_rating"] <= 74:
-            expected_ppp -= 0.015
+            expected_ppp -= 0.012
 
         if ctx["total_off_rating"] >= 83:
-            expected_ppp += 0.018
+            expected_ppp += 0.014
         elif ctx["total_off_rating"] <= 72:
-            expected_ppp -= 0.018
+            expected_ppp -= 0.014
 
         if ctx["total_def_rating"] >= 83:
-            expected_ppp -= 0.014
+            expected_ppp -= 0.012
         elif ctx["total_def_rating"] <= 72:
-            expected_ppp += 0.014
+            expected_ppp += 0.012
 
     if ENABLE_PLAYER_IMPACT_CONTEXT:
         star_impact = safe_float(ctx["home_star"].get("impact"), 0) + safe_float(ctx["away_star"].get("impact"), 0)
-        expected_ppp += max(-0.05, min(0.04, star_impact / 250.0))
+        expected_ppp += max(-0.04, min(0.035, star_impact / 275.0))
 
-    # Efficiency adjustments.
-    if eff["efg"] >= 0.54:
-        expected_ppp += 0.025
-    elif eff["efg"] <= 0.42 and safe_float(info.get("minutes_elapsed")) >= 8:
-        expected_ppp -= 0.025
-
-    # Foul and FT acceleration matters more in WNBA than raw made shots.
+    # WNBA live-style adjustments.
+    # Fouls/bonus and free throws are more reliable than raw hot shooting.
     if eff["ftr"] >= 0.32 or eff["fouls"] >= 20:
-        expected_ppp += 0.035
+        expected_ppp += 0.026
     if eff["ftr"] >= 0.40:
-        expected_ppp += 0.015
+        expected_ppp += 0.012
 
-    # Turnover drag.
-    if eff["turnovers"] >= 18 and safe_float(info.get("minutes_elapsed")) <= 30:
-        expected_ppp -= 0.03
-
-    # Extra possessions.
+    # Offensive rebounding/extra possessions are real. Hot 3PT alone is fragile.
     if eff["off_reb"] >= 12:
-        expected_ppp += 0.025
+        expected_ppp += 0.018
     if eff["fast_break"] >= 16:
-        expected_ppp += 0.02
+        expected_ppp += 0.014
 
-    # Quarter-specific dampening.
-    qprof = quarter_profile(info)
-    if qprof == "Q1_EARLY_SAMPLE":
-        expected_ppp = 0.72 * expected_ppp + 0.28 * DEFAULT_POINTS_PER_POSSESSION
-    elif qprof == "Q4_LATE_HIGH_VARIANCE":
-        expected_ppp = 0.64 * expected_ppp + 0.36 * DEFAULT_POINTS_PER_POSSESSION
+    # Turnovers and empty trips matter in WNBA because possessions are lower.
+    if eff["turnovers"] >= 18 and safe_float(info.get("minutes_elapsed")) <= 30:
+        expected_ppp -= 0.028
+    if eff["efg"] <= 0.42 and eff["ftr"] < 0.24 and safe_float(info.get("minutes_elapsed")) >= 8:
+        expected_ppp -= 0.018
+    elif eff["efg"] >= 0.58 and eff["three_pct"] >= 0.42:
+        # Do not fully chase hot shooting.
+        expected_ppp += 0.010
 
-    diff = abs(info.get("home_score", 0) - info.get("away_score", 0))
-    min_left = safe_float(info.get("minutes_remaining"), 0)
-    late_close_bonus = 0
-    if min_left <= 5 and diff <= 6:
-        late_close_bonus = 4.5
-    elif min_left <= 3 and diff <= 10:
-        late_close_bonus = 2.5
+    expected_ppp, late_close_bonus = score_state_adjustment(info, expected_ppp)
+    expected_ppp = cap_expected_team_ppp(expected_ppp)
 
-    remaining_points = pace["possessions_left"] * expected_ppp * 2
+    current_poss = max(1.0, safe_float(pace.get("current_possessions"), 1.0))
+    raw_projected_poss = safe_float(pace.get("projected_game_possessions"), DEFAULT_GAME_POSSESSIONS)
+    projected_poss_capped = cap_projected_possessions(raw_projected_poss)
+    possessions_left = max(0.0, projected_poss_capped - current_poss)
+
+    remaining_points = possessions_left * expected_ppp * 2.0
     proj = safe_float(info.get("total_score")) + remaining_points + late_close_bonus
 
     return {
         "projected_total": round(proj, 1),
-        "pace": pace, "ppp": ppp,
+        "pace": {
+            **pace,
+            "projected_game_possessions_raw": pace.get("projected_game_possessions"),
+            "projected_game_possessions": round(projected_poss_capped, 2),
+            "possessions_left": round(possessions_left, 2),
+            "pace_vs_default": round(projected_poss_capped - DEFAULT_GAME_POSSESSIONS, 2),
+        },
+        "ppp": ppp,
         "expected_remaining_ppp": round(expected_ppp, 3),
-        "eff": eff, "late_close_bonus": late_close_bonus,
+        "eff": eff,
+        "late_close_bonus": late_close_bonus,
         "quarter_profile": qprof,
         "game_context": ctx,
+        "live_weight": round(live_weight, 2),
+        "projection_caps": ENABLE_PROJECTION_REALITY_CAPS,
     }
 
 def classify_total_market(info, sg, live_total, proj, velocity, move_from_open):
@@ -1437,6 +1620,7 @@ def total_scores(info, sg, markets):
     edge_over = round(proj["projected_total"] - live_total, 1)
     edge_under = round(live_total - proj["projected_total"], 1)
     velocity = line_velocity(sg)
+    short_velocity = short_line_velocity(sg)
     move_from_open = round(live_total - opening_total, 1) if opening_total is not None else 0
     eff = proj["eff"]
     pace = proj["pace"]
@@ -1512,15 +1696,200 @@ def total_scores(info, sg, markets):
 
     return {
         "projection": proj, "live_total": live_total, "opening_total": opening_total,
-        "move_from_open": move_from_open, "velocity": velocity,
+        "move_from_open": move_from_open, "velocity": velocity, "short_velocity": short_velocity,
         "edge_over": edge_over, "edge_under": edge_under,
         "over_confirm": clamp(over_confirm), "under_confirm": clamp(under_confirm),
         "risk_over": clamp(risk_over), "risk_under": clamp(risk_under),
         "over_value": round(over_value), "under_value": round(under_value),
         "market_profile": market_profile,
         "book": total.get("book"), "over_price": total.get("over_price"), "under_price": total.get("under_price"),
-        "market_avg": total.get("market_avg"), "books": total.get("books"),
+        "market_avg": total.get("market_avg"), "market_consensus_avg": total.get("market_consensus_avg"),
+        "market_high": total.get("market_high"), "market_low": total.get("market_low"),
+        "book_vs_market": total.get("book_vs_market"), "line_age_seconds": total.get("line_age_seconds"),
+        "last_update": total.get("last_update"), "books": total.get("books"), "consensus_books": total.get("consensus_books"),
     }
+
+def profile_key_parts(market_type, scenario, quarter_profile, side, alert_tier=None):
+    return "|".join([
+        str(market_type or "UNKNOWN"),
+        str(scenario or "UNKNOWN"),
+        str(quarter_profile or "UNKNOWN"),
+        str(side or "UNKNOWN").upper(),
+        str(alert_tier or "ANY"),
+    ])
+
+def profile_key_for_opp(opp, include_tier=False):
+    if not opp:
+        return "UNKNOWN"
+    return profile_key_parts(
+        opp.get("market_type"),
+        opp.get("scenario"),
+        opp.get("quarter_profile"),
+        opp.get("side"),
+        opp.get("alert_tier") if include_tier else None,
+    )
+
+def profile_key_from_row(row, include_tier=True):
+    return profile_key_parts(
+        row.get("market_type"),
+        row.get("scenario"),
+        row.get("quarter_profile"),
+        row.get("side"),
+        row.get("alert_tier") if include_tier else None,
+    )
+
+def load_profile_rules():
+    data = load_json(PROFILE_RULES_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+def save_profile_rules(data):
+    if ENABLE_ADAPTIVE_PROFILE_RULES:
+        save_json(PROFILE_RULES_FILE, data)
+
+def profile_rule_for(profile):
+    if not ENABLE_ADAPTIVE_PROFILE_RULES or not profile:
+        return {}
+    rules = load_profile_rules()
+    return rules.get(profile, {}) or {}
+
+def profile_rule_for_opp(opp):
+    if not ENABLE_ADAPTIVE_PROFILE_RULES or not opp:
+        return {}
+    rules = load_profile_rules()
+    # Prefer the precise market/scenario/quarter/side key, then fall back to scenario-only legacy keys.
+    key = profile_key_for_opp(opp, include_tier=False)
+    return rules.get(key, {}) or rules.get(opp.get("scenario"), {}) or {}
+
+def apply_profile_rule_adjustment(opp):
+    if not opp or not ENABLE_ADAPTIVE_PROFILE_RULES:
+        return opp
+    rule = profile_rule_for_opp(opp)
+    action = rule.get("action", "MONITOR")
+    if action == "TIGHTEN":
+        opp["confidence"] = round(clamp(safe_float(opp.get("confidence")) - 6))
+        opp["value_score"] = round(clamp(safe_float(opp.get("value_score")) - 5))
+        opp["risk_score"] = round(clamp(safe_float(opp.get("risk_score")) + 8))
+    elif action == "TRUST":
+        opp["confidence"] = round(clamp(safe_float(opp.get("confidence")) + 3))
+        opp["value_score"] = round(clamp(safe_float(opp.get("value_score")) + 3))
+    opp["profile_rule"] = action
+    return opp
+
+def market_discrepancy_for_total(scores, side):
+    total = scores or {}
+    book_line = safe_float(total.get("live_total"), None)
+    market_avg = safe_float(total.get("market_consensus_avg"), safe_float(total.get("market_avg"), None))
+    books = safe_int(total.get("consensus_books", total.get("books", 0)), 0)
+    age = total.get("line_age_seconds")
+    if book_line is None or market_avg is None:
+        return {"status": "NO_MARKET", "score": 0, "book_vs_market": 0, "books": books, "line_age_seconds": age, "reason": "missing market consensus"}
+
+    book_vs_market = round(book_line - market_avg, 2)
+    if side == "OVER":
+        # Lower playable line than the market is favorable for over.
+        advantage = round(market_avg - book_line, 2)
+    else:
+        # Higher playable line than the market is favorable for under.
+        advantage = round(book_line - market_avg, 2)
+
+    score = 0
+    if books >= MARKET_CONSENSUS_MIN_BOOKS:
+        score += 15
+    if advantage >= STRONG_OFF_MARKET_TOTAL_POINTS:
+        score += 35
+    elif advantage >= OFF_MARKET_TOTAL_POINTS:
+        score += 22
+    elif advantage >= 0.5:
+        score += 10
+    elif advantage <= -1.0:
+        score -= 18
+
+    stale = age is not None and safe_float(age, 0) >= STALE_LINE_SECONDS
+    if stale and advantage >= OFF_MARKET_TOTAL_POINTS:
+        score += 12
+    elif stale and advantage <= -0.5:
+        score -= 8
+
+    status = "OFF_MARKET_EDGE" if advantage >= OFF_MARKET_TOTAL_POINTS and books >= MARKET_CONSENSUS_MIN_BOOKS else \
+             "STRONG_OFF_MARKET_EDGE" if advantage >= STRONG_OFF_MARKET_TOTAL_POINTS and books >= MARKET_CONSENSUS_MIN_BOOKS else \
+             "AGAINST_CONSENSUS" if advantage <= -1.0 else "MARKET_ALIGNED"
+    if advantage >= STRONG_OFF_MARKET_TOTAL_POINTS and books >= MARKET_CONSENSUS_MIN_BOOKS:
+        status = "STRONG_OFF_MARKET_EDGE"
+
+    return {
+        "status": status,
+        "score": round(clamp(score, -30, 70)),
+        "book_vs_market": book_vs_market,
+        "advantage_points": advantage,
+        "books": books,
+        "line_age_seconds": age,
+        "stale_line": bool(stale),
+        "reason": f"{side} advantage {advantage} vs consensus avg {market_avg} from playable {book_line}",
+    }
+
+def market_discrepancy_for_spread(offer):
+    if not offer:
+        return {"status": "NO_MARKET", "score": 0, "advantage_points": 0, "reason": "missing spread offer"}
+    book_line = safe_float(offer.get("point"), None)
+    market_avg = safe_float(offer.get("market_consensus_avg"), safe_float(offer.get("market_avg"), None))
+    books = safe_int(offer.get("consensus_books", offer.get("books", 0)), 0)
+    age = offer.get("line_age_seconds")
+    if book_line is None or market_avg is None:
+        return {"status": "NO_MARKET", "score": 0, "advantage_points": 0, "books": books, "line_age_seconds": age, "reason": "missing spread consensus"}
+
+    # For any spread side we are taking, a higher point is a better line.
+    advantage = round(book_line - market_avg, 2)
+    score = 0
+    if books >= MARKET_CONSENSUS_MIN_BOOKS:
+        score += 15
+    if advantage >= SPREAD_STRONG_OFF_MARKET_POINTS:
+        score += 35
+    elif advantage >= SPREAD_OFF_MARKET_POINTS:
+        score += 22
+    elif advantage >= 0.5:
+        score += 10
+    elif advantage <= -0.75:
+        score -= 18
+
+    stale = age is not None and safe_float(age, 0) >= STALE_LINE_SECONDS
+    if stale and advantage >= SPREAD_OFF_MARKET_POINTS:
+        score += 12
+    elif stale and advantage <= -0.5:
+        score -= 8
+
+    if advantage >= SPREAD_STRONG_OFF_MARKET_POINTS and books >= MARKET_CONSENSUS_MIN_BOOKS:
+        status = "STRONG_OFF_MARKET_EDGE"
+    elif advantage >= SPREAD_OFF_MARKET_POINTS and books >= MARKET_CONSENSUS_MIN_BOOKS:
+        status = "OFF_MARKET_EDGE"
+    elif advantage <= -0.75:
+        status = "AGAINST_CONSENSUS"
+    else:
+        status = "MARKET_ALIGNED"
+
+    return {
+        "status": status,
+        "score": round(clamp(score, -30, 70)),
+        "book_vs_market": round(book_line - market_avg, 2),
+        "advantage_points": advantage,
+        "books": books,
+        "line_age_seconds": age,
+        "stale_line": bool(stale),
+        "reason": f"spread advantage {advantage} vs consensus avg {market_avg} from playable {book_line}",
+    }
+
+def log_market_discrepancy(info, label, opp):
+    md = (opp or {}).get("market_discrepancy") or {}
+    if not md:
+        return
+    append_csv(MARKET_DISCREPANCY_FILE, {
+        "date": today(), "time": now_local().isoformat(), "event_id": info.get("event_id"),
+        "game": label, "market_type": opp.get("market_type"), "side": opp.get("side"),
+        "line": opp.get("line"), "book": opp.get("book"), "status": md.get("status"),
+        "score": md.get("score"), "advantage_points": md.get("advantage_points"),
+        "book_vs_market": md.get("book_vs_market"), "books": md.get("books"),
+        "line_age_seconds": md.get("line_age_seconds"), "stale_line": md.get("stale_line"),
+        "reason": md.get("reason"),
+    }, ["date","time","event_id","game","market_type","side","line","book","status","score","advantage_points","book_vs_market","books","line_age_seconds","stale_line","reason"])
 
 def price_ok(price, max_price, elite=False):
     if price is None:
@@ -1553,32 +1922,42 @@ def build_total_opportunity(info, sg, markets):
         "predicted_line_move": 0,
         "future_state": {},
     }
+    market_discrepancy = market_discrepancy_for_total(s, side) if ENABLE_MARKET_DISCREPANCY_ENGINE else {"status": "DISABLED", "score": 0}
 
-    # V1.3: let market mispricing and future state promote good calculated-risk opportunities.
+    # V1.5: true market deficiency gets rewarded; against-consensus model edges get downgraded.
     confidence = round(clamp(confidence + max(0, predictor.get("market_misprice_score", 50) - 65) * 0.22))
     value = round(clamp(value + max(0, predictor.get("market_misprice_score", 50) - 65) * 0.18))
+    confidence = round(clamp(confidence + safe_float(market_discrepancy.get("score"), 0) * 0.18))
+    value = round(clamp(value + safe_float(market_discrepancy.get("score"), 0) * 0.16))
+    if market_discrepancy.get("status") == "AGAINST_CONSENSUS":
+        risk = round(clamp(risk + 10))
 
     block_reason = ""
     action = "WATCH"
 
     if s["projection"]["pace"]["possessions_left"] < MIN_TOTAL_POSSESSIONS_LEFT:
         block_reason = "possessions left too low for total entry"
-    elif ENABLE_MARKET_PREDICTOR_ENGINE and predictor.get("market_misprice_score", 0) < MIN_MARKET_MISPRICE_SCORE:
+    elif ENABLE_MARKET_PREDICTOR_ENGINE and not WIDE_NET_LEARNING_MODE and predictor.get("market_misprice_score", 0) < MIN_MARKET_MISPRICE_SCORE:
         block_reason = f"predictor miss: market misprice {predictor.get('market_misprice_score')} below {MIN_MARKET_MISPRICE_SCORE}"
-    elif ENABLE_MARKET_PREDICTOR_ENGINE and predictor.get("future_state", {}).get("future_state_score", 0) < MIN_FUTURE_STATE_SCORE:
+    elif ENABLE_MARKET_PREDICTOR_ENGINE and not WIDE_NET_LEARNING_MODE and predictor.get("future_state", {}).get("future_state_score", 0) < MIN_FUTURE_STATE_SCORE:
         block_reason = f"future-state miss: {predictor.get('future_state', {}).get('future_state_score')} below {MIN_FUTURE_STATE_SCORE}"
     elif ENABLE_DO_NOT_CHASE_CONTEXT and abs(s.get("move_from_open", 0)) >= DO_NOT_CHASE_TOTAL_MOVE and confidence < DO_NOT_CHASE_MIN_CONFIDENCE:
         block_reason = f"NO CHASE: total already moved {s.get('move_from_open')} from open"
+    elif abs(edge) >= BIG_EDGE_CONSENSUS_REQUIRED and market_discrepancy.get("status") in {"AGAINST_CONSENSUS", "MARKET_ALIGNED", "NO_MARKET"} and confidence < 82:
+        block_reason = f"big model edge without market confirmation: {market_discrepancy.get('status')}"
     elif s["market_profile"] == "NEUTRAL_TOTAL":
         block_reason = "neutral total profile; no market overreaction/underreaction"
-    elif not price_ok(price, MAX_TOTAL_PRICE):
+    elif not price_ok(price, MAX_TOTAL_PRICE) and confidence < 82:
         block_reason = f"total price too expensive: {price}"
     elif edge >= MIN_TOTAL_EDGE_POINTS and confidence >= MIN_TOTAL_CONFIDENCE and value >= MIN_TOTAL_VALUE_SCORE and risk <= MAX_TOTAL_RISK_SCORE:
         action = "STRIKE"
+    elif wide_net_strike_ok(edge, confidence, value, risk, predictor, s["market_profile"]):
+        action = "STRIKE"
+        block_reason = ""
     else:
         block_reason = f"gate miss: edge {edge}, conf {confidence}, value {value}, risk {risk}"
 
-    return {
+    return assign_alert_tier(apply_profile_rule_adjustment({
         "market_type": "TOTAL", "side": side, "team_side": "",
         "line": s["live_total"], "price": price, "book": s["book"],
         "edge": edge, "projected_total": s["projection"]["projected_total"],
@@ -1590,7 +1969,10 @@ def build_total_opportunity(info, sg, markets):
         "market_misprice_score": predictor.get("market_misprice_score"),
         "predicted_line_move": predictor.get("predicted_line_move"),
         "future_state_score": predictor.get("future_state", {}).get("future_state_score"),
-    }
+        "market_discrepancy": market_discrepancy,
+        "market_discrepancy_status": market_discrepancy.get("status"),
+        "market_discrepancy_score": market_discrepancy.get("score"),
+    }))
 
 # =============================================================================
 # Favorite buyback professional model
@@ -1844,17 +2226,23 @@ def favorite_buyback_scores(info, sg, markets):
         "run_sustainability": {},
     }
 
+    market_discrepancy = market_discrepancy_for_spread(spread) if ENABLE_MARKET_DISCREPANCY_ENGINE else {"status": "DISABLED", "score": 0}
+
     confidence = round(clamp(confidence + max(0, predictor.get("market_misprice_score", 50) - 65) * 0.25))
     value = round(clamp(value + max(0, predictor.get("market_misprice_score", 50) - 65) * 0.20))
+    confidence = round(clamp(confidence + safe_float(market_discrepancy.get("score"), 0) * 0.16))
+    value = round(clamp(value + safe_float(market_discrepancy.get("score"), 0) * 0.14))
+    if market_discrepancy.get("status") == "AGAINST_CONSENSUS":
+        risk = round(clamp(risk + 10))
 
     block_reason = ""
     action = "WATCH"
 
     if STAR_OUT_BUYBACK_BLOCK and star.get("star_status") == "out":
         block_reason = "NO BET: favorite star marked out"
-    elif ENABLE_MARKET_PREDICTOR_ENGINE and predictor.get("market_misprice_score", 0) < MIN_MARKET_MISPRICE_SCORE:
+    elif ENABLE_MARKET_PREDICTOR_ENGINE and not WIDE_NET_LEARNING_MODE and predictor.get("market_misprice_score", 0) < MIN_MARKET_MISPRICE_SCORE:
         block_reason = f"predictor miss: market misprice {predictor.get('market_misprice_score')} below {MIN_MARKET_MISPRICE_SCORE}"
-    elif ENABLE_MARKET_PREDICTOR_ENGINE and predictor.get("future_state", {}).get("future_state_score", 0) < MIN_FUTURE_STATE_SCORE:
+    elif ENABLE_MARKET_PREDICTOR_ENGINE and not WIDE_NET_LEARNING_MODE and predictor.get("future_state", {}).get("future_state_score", 0) < MIN_FUTURE_STATE_SCORE:
         block_reason = f"future-state miss: {predictor.get('future_state', {}).get('future_state_score')} below {MIN_FUTURE_STATE_SCORE}"
     elif ENABLE_TEAM_STRENGTH_CONTEXT and strength_edge < -2:
         block_reason = f"NO BET: favorite no longer rates better after context edge {strength_edge}"
@@ -1864,16 +2252,20 @@ def favorite_buyback_scores(info, sg, markets):
         block_reason = "NO BET: " + "; ".join(no_bet_reasons[:3])
     elif run_quality == "REAL_UNDERDOG_CONTROL_RUN":
         block_reason = "NO BET: underdog run looks structural, not noisy"
+    elif market_discrepancy.get("status") == "AGAINST_CONSENSUS" and confidence < 82:
+        block_reason = f"spread against market consensus: {market_discrepancy.get('reason')}"
     elif not price_ok(price, MAX_SPREAD_PRICE):
         if not (safe_int(price) >= ELITE_SPREAD_MAX_PRICE and confidence >= ELITE_SPREAD_MIN_CONFIDENCE):
             block_reason = f"spread price too expensive: {price}"
     if not block_reason:
         if confidence >= FAVORITE_BUYBACK_MIN_CONFIDENCE and value >= FAVORITE_BUYBACK_MIN_VALUE_SCORE and risk <= FAVORITE_BUYBACK_MAX_RISK:
             action = "STRIKE"
+        elif wide_net_spread_ok(confidence, value, risk, predictor, block_reason):
+            action = "STRIKE"
         else:
             block_reason = f"gate miss: conf {confidence}, value {value}, risk {risk}"
 
-    return {
+    return assign_alert_tier(apply_profile_rule_adjustment({
         "market_type": "SPREAD",
         "side": team_side_name(info, fav),
         "team_side": fav,
@@ -1907,11 +2299,101 @@ def favorite_buyback_scores(info, sg, markets):
         "market_misprice_score": predictor.get("market_misprice_score"),
         "predicted_spread_contract": predictor.get("predicted_spread_contract"),
         "future_state_score": predictor.get("future_state", {}).get("future_state_score"),
-    }
+        "market_discrepancy": market_discrepancy,
+        "market_discrepancy_status": market_discrepancy.get("status"),
+        "market_discrepancy_score": market_discrepancy.get("score"),
+        "profile_rule": "MONITOR",
+    }))
 
 # =============================================================================
 # Decision, SMS, logging
 # =============================================================================
+def assign_alert_tier(opp):
+    """
+    Wide-net learning tiers:
+    A+ = strongest profile
+    B = normal playable
+    SMALL = data collection / lower unit
+    """
+    if not opp:
+        return opp
+    confidence = safe_float(opp.get("confidence"), 0)
+    value = safe_float(opp.get("value_score"), 0)
+    risk = safe_float(opp.get("risk_score"), 100)
+    misprice = safe_float(opp.get("market_misprice_score"), 50)
+    future = safe_float(opp.get("future_state_score"), 50)
+    edge = safe_float(opp.get("edge"), 0)
+    sanity = sanity_edge_tag(edge)
+
+    discrepancy = safe_float(opp.get("market_discrepancy_score"), 0)
+    profile_rule = opp.get("profile_rule", "MONITOR")
+    score = confidence * 0.30 + value * 0.26 + misprice * 0.20 + future * 0.09 + discrepancy * 0.16 - risk * 0.17
+    if opp.get("market_type") == "TOTAL":
+        score += min(edge, 12) * 0.9
+    else:
+        score += min(edge, 6) * 1.2
+
+    if sanity == "HARD_SANITY_CHECK":
+        score -= 12
+    elif sanity == "SANITY_CHECK":
+        score -= 6
+    if profile_rule == "TIGHTEN":
+        score -= 6
+    elif profile_rule == "TRUST":
+        score += 3
+
+    if score >= 64 and confidence >= 76 and value >= 72 and risk <= 48 and sanity == "NORMAL_EDGE":
+        tier, units = "A_PLUS", UNIT_A_PLUS
+    elif score >= 52 and confidence >= 66 and value >= 62 and risk <= 62:
+        tier, units = "B_STRIKE", UNIT_B
+    else:
+        tier, units = "SMALL_LEAN", UNIT_SMALL
+
+    opp["alert_tier"] = tier
+    opp["unit_size"] = units
+    opp["sanity_tag"] = sanity
+    opp["learning_score"] = round(score, 1)
+
+    # Learning can remain wide, but paid alerts should be controlled.
+    paid_alert = tier in {"A_PLUS", "B_STRIKE"}
+    if tier == "SMALL_LEAN" and SEND_SMALL_LEAN_SMS:
+        paid_alert = True
+    if BAD_PROFILE_BLOCK_PAID and profile_rule == "TIGHTEN" and tier != "A_PLUS":
+        paid_alert = False
+    if REQUIRE_MARKET_CONFIRMATION_FOR_SMALL and tier == "SMALL_LEAN" and opp.get("market_discrepancy_status") not in {"OFF_MARKET_EDGE", "STRONG_OFF_MARKET_EDGE"}:
+        paid_alert = False
+    opp["paid_alert"] = paid_alert
+    return opp
+
+def wide_net_strike_ok(edge, confidence, value, risk, predictor, scenario):
+    if not WIDE_NET_LEARNING_MODE:
+        return False
+    if scenario == "NEUTRAL_TOTAL":
+        return False
+    return (
+        safe_float(edge) >= 2.0
+        and safe_float(confidence) >= 54
+        and safe_float(value) >= 52
+        and safe_float(risk) <= 78
+        and safe_float(predictor.get("market_misprice_score", 0)) >= 48
+        and safe_float(predictor.get("future_state", {}).get("future_state_score", 0)) >= 42
+    )
+
+def wide_net_spread_ok(confidence, value, risk, predictor, block_reason):
+    if not WIDE_NET_LEARNING_MODE:
+        return False
+    hard_blocks = ["star marked out", "structural", "not enough possessions", "late Q4"]
+    if any(x in (block_reason or "").lower() for x in hard_blocks):
+        return False
+    return (
+        safe_float(confidence) >= 54
+        and safe_float(value) >= 52
+        and safe_float(risk) <= 78
+        and safe_float(predictor.get("market_misprice_score", 0)) >= 48
+        and safe_float(predictor.get("future_state", {}).get("future_state_score", 0)) >= 42
+    )
+
+
 def opportunity_key(opp):
     if not opp:
         return ""
@@ -1934,6 +2416,8 @@ def already_alerted(sg, opp):
 def approve_opportunity(sg, opp):
     if not opp or opp.get("action") != "STRIKE":
         return False, opp.get("block_reason", "not STRIKE") if opp else "no opportunity"
+    if not opp.get("paid_alert", True):
+        return False, f"log-only learning play: tier {opp.get('alert_tier')} | profile {opp.get('profile_rule', 'MONITOR')} | market {opp.get('market_discrepancy_status', 'N/A')}"
     blocked, reason = already_alerted(sg, opp)
     if blocked:
         return False, reason
@@ -1946,6 +2430,7 @@ def mark_alert_sent(sg, opp):
         "side": opp.get("side"), "team_side": opp.get("team_side"),
         "line": opp.get("line"), "price": opp.get("price"),
         "confidence": opp.get("confidence"), "scenario": opp.get("scenario"),
+        "alert_tier": opp.get("alert_tier"), "unit_size": opp.get("unit_size"),
     })
 
 def reason_lines(info, opp):
@@ -1956,9 +2441,12 @@ def reason_lines(info, opp):
         pace = proj.get("pace", {})
         eff = proj.get("eff", {})
         lines.append(f"Projected {opp['projected_total']} vs live {opp['line']} = {opp['edge']} pt edge")
-        lines.append(f"Pace {pace.get('projected_game_possessions')} poss | left {pace.get('possessions_left')} | PPP {proj.get('ppp')}")
-        lines.append(f"Profile {opp['scenario']} | open move {scores.get('move_from_open')} | velocity {scores.get('velocity')}")
+        lines.append(f"Pace {pace.get('projected_game_possessions')} poss | left {pace.get('possessions_left')} | team PPP {proj.get('ppp')} | live wt {proj.get('live_weight')}")
+        lines.append(f"Profile {opp['scenario']} | open move {scores.get('move_from_open')} | velocity {scores.get('velocity')} | short {scores.get('short_velocity')}")
         lines.append(f"Predictor: misprice {opp.get('market_misprice_score')} | future {opp.get('future_state_score')} | next move {opp.get('predicted_line_move')}")
+        md = opp.get("market_discrepancy") or {}
+        if md:
+            lines.append(f"Market deficiency: {md.get('status')} | adv {md.get('advantage_points')} | books {md.get('books')} | stale {md.get('stale_line')}")
         lines.append(f"eFG {eff.get('efg')} | FTr {eff.get('ftr')} | TO {eff.get('turnovers')} | OREB {eff.get('off_reb')} | Fouls {eff.get('fouls')}")
     else:
         run = scores.get("run", {})
@@ -1990,8 +2478,10 @@ def format_sms(label, info, opp):
         f"Market: {market}",
         f"Scenario: {opp.get('scenario')}",
         f"Quarter Profile: {opp.get('quarter_profile')}",
+        f"Tier: {opp.get('alert_tier', 'B_STRIKE')} | Unit: {opp.get('unit_size', UNIT_B)}u | Paid: {opp.get('paid_alert', True)} | Sanity: {opp.get('sanity_tag', 'NORMAL_EDGE')}",
         f"Confidence: {opp.get('confidence')}/100 | Value {opp.get('value_score')}/100 | Risk {opp.get('risk_score')}/100",
         f"Predictor: Misprice {opp.get('market_misprice_score')}/100 | Future {opp.get('future_state_score')}/100",
+        f"Market Edge: {opp.get('market_discrepancy_status', 'N/A')} | Score {opp.get('market_discrepancy_score', 'N/A')} | Rule {opp.get('profile_rule', 'MONITOR')}",
         f"Score: {info['away_score']}-{info['home_score']} | Q{info['period']} {info['clock']} | Left {info['minutes_remaining']} min",
     ]
     if opp["market_type"] == "TOTAL":
@@ -2010,31 +2500,35 @@ def format_sms(label, info, opp):
         text = text[:MAX_SHORT_SMS_CHARS - 20].rstrip() + "\n[Trimmed]"
     return text
 
-def should_send_sms(text):
+def should_send_sms(text, force=False):
+    if force:
+        return True
     if not SEND_ONLY_STRIKE_SMS:
         return True
     body = (text or "").upper()
     return "BET NOW" in body and "SHIFT WNBA STRIKE" in body
 
-def send_text(text):
+def send_text(text, force=False):
     print("\n" + text + "\n")
-    if not should_send_sms(text):
+    if not should_send_sms(text, force=force):
         print("TEXT NOT SENT: non-BET NOW alert logged only.")
-        return
+        return False
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER, ALERT_TO_NUMBER]):
         print("TEXT NOT SENT: Missing Twilio variables.")
-        return
+        return False
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         client.messages.create(body=text, from_=TWILIO_FROM_NUMBER, to=ALERT_TO_NUMBER)
         print("TEXT SENT SUCCESSFULLY")
+        return True
     except Exception as e:
         print("TEXT ERROR:", repr(e))
+        return False
 
 STRIKE_FIELDS = [
     "date","time","event_id","game","market_type","side","team_side","line","price","book","scenario","quarter_profile",
     "confidence","value_score","risk_score","edge","projected_total","market_misprice_score","future_state_score","predicted_market_move","score","period","clock",
-    "closing_line","closing_price","clv","final_score","final_total","result","units"
+    "alert_tier","unit_size","sanity_tag","learning_score","profile_rule","paid_alert","market_discrepancy_status","market_discrepancy_score","market_advantage_points","closing_line","closing_price","clv","final_score","final_total","result","units"
 ]
 
 def log_strike(info, label, opp):
@@ -2050,6 +2544,13 @@ def log_strike(info, label, opp):
         "market_misprice_score": opp.get("market_misprice_score"),
         "future_state_score": opp.get("future_state_score"),
         "predicted_market_move": opp.get("predicted_line_move") if opp.get("market_type") == "TOTAL" else opp.get("predicted_spread_contract"),
+        "alert_tier": opp.get("alert_tier"), "unit_size": opp.get("unit_size"),
+        "sanity_tag": opp.get("sanity_tag"), "learning_score": opp.get("learning_score"),
+        "profile_rule": opp.get("profile_rule"),
+        "paid_alert": opp.get("paid_alert"),
+        "market_discrepancy_status": opp.get("market_discrepancy_status"),
+        "market_discrepancy_score": opp.get("market_discrepancy_score"),
+        "market_advantage_points": (opp.get("market_discrepancy") or {}).get("advantage_points"),
         "score": f"{info['away_score']}-{info['home_score']}",
         "period": info.get("period"), "clock": info.get("clock"),
         "closing_line": "", "closing_price": "", "clv": "",
@@ -2074,6 +2575,138 @@ def log_near_miss(info, label, opp, reason):
         "date","time","event_id","game","market_type","side","team_side","line","price","book","scenario","quarter_profile",
         "confidence","value_score","risk_score","edge","market_misprice_score","future_state_score","predicted_market_move","reason"
     ])
+
+def result_lesson(row):
+    result = row.get("result")
+    scenario = row.get("scenario") or "UNKNOWN"
+    market = row.get("market_type")
+    side = str(row.get("side", "")).upper()
+    line = safe_float(row.get("line"))
+    final_total = safe_float(row.get("final_total"))
+    clv = safe_float(row.get("clv"), None) if row.get("clv") not in (None, "") else None
+
+    if market == "TOTAL":
+        margin = round(final_total - line, 1) if side == "OVER" else round(line - final_total, 1)
+        if result == "WIN":
+            base = f"Won by {margin}; profile held."
+        elif result == "LOSS":
+            base = f"Lost by {abs(margin)}; profile failed or market corrected."
+        else:
+            base = "Push; number was efficient."
+    else:
+        base = "Spread result graded by cover margin."
+
+    if clv is not None:
+        if clv >= GOOD_CLV_THRESHOLD:
+            base += " Good CLV."
+        elif clv <= -GOOD_CLV_THRESHOLD:
+            base += " Bad CLV; tighten this bucket."
+        else:
+            base += " Neutral CLV."
+
+    if "PACE_CONTINUATION_OVER" in scenario and result == "LOSS":
+        base += " Watch for late pace collapse."
+    elif "FAST_DROP_BUY_OVER" in scenario and result == "LOSS":
+        base += " Market drop may have been right, not a discount."
+    elif "FAST_SPIKE_FADE_UNDER" in scenario and result == "LOSS":
+        base += " Hot scoring did not regress."
+    elif "FAVORITE_BUYBACK" in scenario and result == "LOSS":
+        base += " Buyback failed; run may have been structural."
+
+    return base
+
+
+def historical_rows_through_today():
+    return [r for r in read_csv_rows(GRADED_RESULTS_FILE) if r.get("date") <= today()]
+
+def rows_for_date(date_text):
+    return [r for r in read_csv_rows(GRADED_RESULTS_FILE) if r.get("date") == date_text]
+
+def summarize_rows(rows):
+    wins = sum(1 for r in rows if r.get("result") == "WIN")
+    losses = sum(1 for r in rows if r.get("result") == "LOSS")
+    pushes = sum(1 for r in rows if r.get("result") == "PUSH")
+    units = round(sum(safe_float(r.get("units"), 0) for r in rows), 2)
+    risked = round(sum(safe_float(r.get("unit_size"), 0) for r in rows if r.get("result") in {"WIN", "LOSS", "PUSH"}), 2)
+    roi = round((units / risked) * 100, 1) if risked else 0.0
+    win_pct = round((wins / max(1, wins + losses)) * 100, 1) if (wins + losses) else 0.0
+    return {"wins": wins, "losses": losses, "pushes": pushes, "units": units, "risked": risked, "roi": roi, "win_pct": win_pct}
+
+def best_worst_profile(rows):
+    buckets = {}
+    for r in rows:
+        key = profile_key_from_row(r, include_tier=False)
+        rec = buckets.setdefault(key, {"w": 0, "l": 0, "p": 0, "u": 0.0})
+        if r.get("result") == "WIN":
+            rec["w"] += 1
+        elif r.get("result") == "LOSS":
+            rec["l"] += 1
+        else:
+            rec["p"] += 1
+        rec["u"] += safe_float(r.get("units"), 0)
+    if not buckets:
+        return None, None
+    ranked = sorted(buckets.items(), key=lambda kv: kv[1]["u"], reverse=True)
+    def fmt(item):
+        key, rec = item
+        return f"{key} | {rec['w']}-{rec['l']}-{rec['p']} | {round(rec['u'],2)}u"
+    return fmt(ranked[0]), fmt(ranked[-1])
+
+def tier_summary(rows, tier):
+    tier_rows = [r for r in rows if str(r.get("alert_tier", "")).upper() == tier]
+    sm = summarize_rows(tier_rows)
+    return f"{tier}: {sm['wins']}-{sm['losses']}-{sm['pushes']} | {sm['units']}u"
+
+def update_bankroll_tracker(summary):
+    season_rows = historical_rows_through_today()
+    season = summarize_rows(season_rows)
+    ending = round(STARTING_BANKROLL_UNITS + season["units"], 2)
+    best, worst = best_worst_profile(rows_for_date(today()))
+    append_csv(BANKROLL_TRACKER_FILE, {
+        "date": today(),
+        "starting_bankroll_units": STARTING_BANKROLL_UNITS,
+        "ending_bankroll_units": ending,
+        "daily_units": summary.get("units", 0),
+        "season_units": season.get("units", 0),
+        "units_risked_today": summary.get("risked", 0),
+        "daily_roi_pct": summary.get("roi", 0),
+        "season_record": f"{season['wins']}-{season['losses']}-{season['pushes']}",
+        "best_profile": best or "N/A",
+        "worst_profile": worst or "N/A",
+        "updated_at": now_local().isoformat(),
+    }, ["date","starting_bankroll_units","ending_bankroll_units","daily_units","season_units","units_risked_today","daily_roi_pct","season_record","best_profile","worst_profile","updated_at"])
+    return ending, season
+
+def format_result_sms(label, graded_rows):
+    if not graded_rows:
+        return ""
+    sm = summarize_rows(graded_rows)
+    lines = [
+        "✅ SHIFT WNBA RESULT",
+        label,
+        "",
+        f"Game: {sm['wins']}-{sm['losses']}-{sm['pushes']} | {sm['units']}u",
+    ]
+
+    for r in graded_rows[:4]:
+        market = r.get("market_type")
+        side = r.get("side")
+        line = r.get("line")
+        price = r.get("price")
+        result = r.get("result")
+        units_row = r.get("units")
+        clv = r.get("clv") if r.get("clv") not in (None, "") else "N/A"
+        play = f"{side} {line}" if market == "TOTAL" else f"{side} +{line}"
+        icon = "✅" if result == "WIN" else "❌" if result == "LOSS" else "➖"
+        lines.extend([
+            "",
+            f"{icon} {play} ({price})",
+            f"Result: {result} | Units: {units_row}u | CLV: {clv}",
+            f"Final: {r.get('final_score')} | Total: {r.get('final_total')}",
+            f"Why: {result_lesson(r)}",
+        ])
+
+    return "\n".join(lines[:24])
 
 # =============================================================================
 # CLV and grading
@@ -2152,8 +2785,9 @@ def latest_clv_for_strike(row):
 
 def grade_completed_strikes(event_id, label, final_score):
     rows = read_csv_rows(STRIKE_HISTORY_FILE)
+    new_graded = []
     if not rows:
-        return
+        return new_graded
 
     graded_keys = set()
     if os.path.exists(GRADED_RESULTS_FILE):
@@ -2163,7 +2797,7 @@ def grade_completed_strikes(event_id, label, final_score):
     try:
         away, home = [safe_int(x) for x in str(final_score).split("-")]
     except Exception:
-        return
+        return new_graded
     final_total = away + home
     home_margin = home - away
 
@@ -2199,10 +2833,13 @@ def grade_completed_strikes(event_id, label, final_score):
         out["final_score"] = final_score
         out["final_total"] = final_total
         out["result"] = result
-        out["units"] = result_units(result, price)
+        out["units"] = result_units(result, price, r.get("unit_size", 1.0))
         out["graded_at"] = now_local().isoformat()
         append_csv(GRADED_RESULTS_FILE, out, list(out.keys()))
+        new_graded.append(out)
         print(f"GRADED | {label} | {market_type} {side} {line} | {result} | CLV {clv} | Final {final_score}")
+
+    return new_graded
 
 # =============================================================================
 # Daily report / learning summary
@@ -2257,7 +2894,7 @@ def summarize_today():
         if r.get("clv") not in (None, ""):
             qrec["clv"].append(safe_float(r.get("clv")))
 
-        profile = r.get("scenario") or "UNKNOWN"
+        profile = profile_key_from_row(r, include_tier=False)
         rec = by_profile.setdefault(profile, {"w": 0, "l": 0, "p": 0, "u": 0.0, "clv": []})
         if r.get("result") == "WIN":
             rec["w"] += 1
@@ -2301,8 +2938,20 @@ def summarize_today():
         "win_pct": win_pct, "units": units, "strikes": len(strikes), "near_misses": len(near),
         "avg_clv": avg_clv, "positive_clv_count": positive_clv, "clv_snapshots": len(clv_rows),
         "avg_predictor": avg_predictor,
+        "risked": round(sum(safe_float(r.get("unit_size"), 0) for r in rows if r.get("result") in {"WIN", "LOSS", "PUSH"}), 2),
+        "roi": 0.0,
         "profile_lines": profile_lines, "market_lines": market_lines, "quarter_lines": quarter_lines,
     }
+
+    adaptive_rules = update_adaptive_profile_rules_from_rows(rows)
+    summary["roi"] = round((summary["units"] / summary["risked"]) * 100, 1) if summary.get("risked") else 0.0
+    best_profile, worst_profile = best_worst_profile(rows)
+    summary["best_profile"] = best_profile or "N/A"
+    summary["worst_profile"] = worst_profile or "N/A"
+    ending_bankroll, season_summary = update_bankroll_tracker(summary)
+    summary["ending_bankroll"] = ending_bankroll
+    summary["season_summary"] = season_summary
+    summary["adaptive_rules"] = adaptive_rules
 
     append_csv(DAILY_SUMMARY_FILE, {
         "date": today(), "graded": graded, "wins": wins, "losses": losses, "pushes": pushes,
@@ -2313,37 +2962,63 @@ def summarize_today():
 
     return summary
 
+def update_adaptive_profile_rules_from_rows(rows):
+    if not ENABLE_ADAPTIVE_PROFILE_RULES:
+        return {}
+    by_profile = {}
+    for r in rows:
+        profile = profile_key_from_row(r, include_tier=False)
+        rec = by_profile.setdefault(profile, {"w":0,"l":0,"p":0,"u":0.0,"clv":[]})
+        if r.get("result") == "WIN": rec["w"] += 1
+        elif r.get("result") == "LOSS": rec["l"] += 1
+        else: rec["p"] += 1
+        rec["u"] += safe_float(r.get("units"), 0)
+        if r.get("clv") not in (None, ""):
+            rec["clv"].append(safe_float(r.get("clv"), 0))
+    rules = load_profile_rules()
+    for profile, rec in by_profile.items():
+        sample = rec["w"] + rec["l"] + rec["p"]
+        if sample < PROFILE_RULE_MIN_SAMPLE:
+            continue
+        avg_clv = round(sum(rec["clv"]) / len(rec["clv"]), 2) if rec["clv"] else 0.0
+        win_pct = round(rec["w"] / max(1, rec["w"] + rec["l"]) * 100, 1) if (rec["w"] + rec["l"]) else 0.0
+        units = round(rec["u"], 2)
+        if units > 0 and avg_clv >= PROFILE_TRUST_CLV:
+            action = "TRUST"
+        elif units < 0 and avg_clv <= PROFILE_TIGHTEN_CLV:
+            action = "TIGHTEN"
+        elif units < -1.5:
+            action = "TIGHTEN"
+        else:
+            action = "MONITOR"
+        rules[profile] = {
+            "action": action, "sample": sample, "wins": rec["w"], "losses": rec["l"], "pushes": rec["p"],
+            "win_pct": win_pct, "units": units, "avg_clv": avg_clv, "updated_at": now_local().isoformat(),
+        }
+    save_profile_rules(rules)
+    return rules
+
 def format_daily_report(summary):
+    season = summary.get("season_summary", {}) or {}
     lines = [
-        f"SHIFT WNBA DAILY REPORT — {summary['date']}",
+        f"📊 SHIFT WNBA DAILY SUMMARY — {summary['date']}",
         "",
-        f"Results: {summary['wins']}-{summary['losses']}-{summary['pushes']} | {summary['win_pct']}% | {summary['units']}u",
-        f"Alerts: {summary['strikes']} STRIKE | Near-misses logged: {summary['near_misses']}",
-        f"CLV: avg {summary['avg_clv']} | +CLV snapshots {summary['positive_clv_count']}/{summary['clv_snapshots']}",
-        f"Predictor: avg misprice score {summary.get('avg_predictor', 0)}",
+        f"Today: {summary['wins']}-{summary['losses']}-{summary['pushes']} | {summary['units']}u",
+        f"Risked: {summary.get('risked', 0)}u | ROI: {summary.get('roi', 0)}%",
+        f"Alerts: {summary['strikes']} STRIKE | Near-misses: {summary['near_misses']}",
+        f"CLV: avg {summary['avg_clv']} | +CLV {summary['positive_clv_count']}/{summary['clv_snapshots']}",
         "",
-        "Profile Review:"
+        f"Season: {season.get('wins', 0)}-{season.get('losses', 0)}-{season.get('pushes', 0)} | {season.get('units', 0)}u",
+        f"Bankroll: {summary.get('ending_bankroll', STARTING_BANKROLL_UNITS)}u",
+        "",
+        tier_summary(read_csv_rows(GRADED_RESULTS_FILE), "A_PLUS"),
+        tier_summary(read_csv_rows(GRADED_RESULTS_FILE), "B_STRIKE"),
+        "",
+        f"Best Profile: {summary.get('best_profile', 'N/A')}",
+        f"Worst Profile: {summary.get('worst_profile', 'N/A')}",
+        "",
+        "Rule: trust +units/+CLV profiles, tighten -units/-CLV profiles, keep SMALL_LEAN log-only."
     ]
-    if summary["profile_lines"]:
-        lines.extend([f"- {x}" for x in summary["profile_lines"][:8]])
-    else:
-        lines.append("- Not enough graded profile samples yet.")
-    lines.append("")
-    lines.append("Market Review:")
-    if summary.get("market_lines"):
-        lines.extend([f"- {x}" for x in summary["market_lines"][:5]])
-    else:
-        lines.append("- Not enough market samples yet.")
-
-    lines.append("")
-    lines.append("Quarter Review:")
-    if summary.get("quarter_lines"):
-        lines.extend([f"- {x}" for x in summary["quarter_lines"][:5]])
-    else:
-        lines.append("- Not enough quarter samples yet.")
-
-    lines.append("")
-    lines.append("Next adjustment: trust profiles with positive CLV; tighten profiles losing with negative CLV; watch Q4 late variance.")
     return "\n".join(lines)
 
 def send_email_report(text):
@@ -2360,7 +3035,7 @@ def send_email_report(text):
         msg.set_content(text)
 
         if ATTACH_DAILY_CSVS_TO_EMAIL:
-            for path in [STRIKE_HISTORY_FILE, GRADED_RESULTS_FILE, CLV_HISTORY_FILE, NEAR_MISS_FILE, DAILY_SUMMARY_FILE, PROFILE_SUMMARY_FILE]:
+            for path in [STRIKE_HISTORY_FILE, GRADED_RESULTS_FILE, CLV_HISTORY_FILE, NEAR_MISS_FILE, DAILY_SUMMARY_FILE, PROFILE_SUMMARY_FILE, MARKET_DISCREPANCY_FILE, PROFILE_RULES_FILE, BANKROLL_TRACKER_FILE]:
                 if os.path.exists(path):
                     with open(path, "rb") as f:
                         msg.add_attachment(f.read(), maintype="text", subtype="csv", filename=os.path.basename(path))
@@ -2384,8 +3059,8 @@ def maybe_send_daily_report(st, force=False):
     summary = summarize_today()
     report = format_daily_report(summary)
     print("\n" + report + "\n")
-    if SEND_DAILY_LEARNING_REPORT_SMS:
-        send_text(report[:MAX_SHORT_SMS_CHARS])
+    if SEND_DAILY_LEARNING_REPORT_SMS and SEND_SIMPLE_DAILY_SUMMARY_SMS:
+        send_text(report[:MAX_SHORT_SMS_CHARS], force=True)
     send_email_report(report)
     st["daily_report_sent"] = True
     save_state(st)
@@ -2452,7 +3127,11 @@ def run_once():
             info = parse_live_game(ev, {})
             final_score = f"{info['away_score']}-{info['home_score']}"
             mark_final_locked(st, event_id, label, final_score)
-            grade_completed_strikes(event_id, label, final_score)
+            graded_rows = grade_completed_strikes(event_id, label, final_score)
+            if SEND_RESULT_SMS and SEND_SIMPLE_RESULT_SMS and graded_rows:
+                result_sms = format_result_sms(label, graded_rows)
+                if result_sms:
+                    send_text(result_sms[:MAX_SHORT_SMS_CHARS], force=True)
             print(f"FINAL LOCKED | {label} | Score {final_score} | no more tracking today")
             save_state(st)
             continue
@@ -2500,6 +3179,7 @@ def run_once():
                 sms = format_sms(label, info, best)
                 send_text(sms)
                 log_strike(info, label, best)
+                log_market_discrepancy(info, label, best)
                 mark_alert_sent(sg, best)
                 save_state(st)
             else:
