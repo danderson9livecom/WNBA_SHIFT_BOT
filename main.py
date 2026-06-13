@@ -57,8 +57,8 @@ load_dotenv()
 # =============================================================================
 # Identity / timezone / files
 # =============================================================================
-APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V3.2.0")
-APP_MODE = "BETMGM PRO V3.2 + GOOGLE SHEETS DECISION DATABASE"
+APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V3.4.0")
+APP_MODE = "BETMGM PRO V3.4 + DECISION LEARNING UPSERT"
 APP_BUILD_LABEL = f"SHIFT WNBA {APP_VERSION} {APP_MODE}"
 TZ = ZoneInfo("America/Phoenix")
 
@@ -95,6 +95,13 @@ WNBA_ADAPTIVE_STRONG_ROI = float(os.getenv("WNBA_ADAPTIVE_STRONG_ROI", "0.04"))
 WNBA_ADAPTIVE_WEAK_ROI = float(os.getenv("WNBA_ADAPTIVE_WEAK_ROI", "-0.03"))
 WNBA_ADAPTIVE_STRONG_CLV = float(os.getenv("WNBA_ADAPTIVE_STRONG_CLV", "0.50"))
 WNBA_ADAPTIVE_WEAK_CLV = float(os.getenv("WNBA_ADAPTIVE_WEAK_CLV", "-0.50"))
+WNBA_ENABLE_SHEETS_UPSERT_HINTS = os.getenv("WNBA_ENABLE_SHEETS_UPSERT_HINTS", "true").lower() == "true"
+WNBA_DECISION_UPSERT_KEY = os.getenv("WNBA_DECISION_UPSERT_KEY", "snapshot_id")
+WNBA_SNAPSHOT_BUCKET_SECONDS = int(os.getenv("WNBA_SNAPSHOT_BUCKET_SECONDS", "180"))
+WNBA_ENABLE_PASSED_PLAY_ADAPTIVE_LEARNING = os.getenv("WNBA_ENABLE_PASSED_PLAY_ADAPTIVE_LEARNING", "true").lower() == "true"
+WNBA_PASSED_PLAY_MIN_SAMPLE = int(os.getenv("WNBA_PASSED_PLAY_MIN_SAMPLE", "20"))
+WNBA_PASSED_PLAY_LOOSEN_UNITS = float(os.getenv("WNBA_PASSED_PLAY_LOOSEN_UNITS", "2.0"))
+WNBA_PASSED_PLAY_TIGHTEN_UNITS = float(os.getenv("WNBA_PASSED_PLAY_TIGHTEN_UNITS", "-2.0"))
 
 # =============================================================================
 # Credentials / providers
@@ -593,9 +600,23 @@ def post_tracking_event(event_type, payload):
     body = {
         "event_type": event_type,
         "sent_at": now_local().isoformat(),
-        "source": "SHIFT_WNBA_V3_2_DECISION_DATABASE",
+        "source": "SHIFT_WNBA_V3_4_DECISION_LEARNING_UPSERT",
         "payload": payload,
     }
+    if WNBA_ENABLE_SHEETS_UPSERT_HINTS and isinstance(payload, dict):
+        # Apps Script can use these hints to route and update rows instead of only appending.
+        if event_type in {"wnba_decision", "wnba_decision_market_update", "wnba_decision_result"}:
+            body["sheet_tab"] = "Decision_Database"
+            body["upsert_key"] = WNBA_DECISION_UPSERT_KEY
+            body["upsert_value"] = payload.get(WNBA_DECISION_UPSERT_KEY) or payload.get("decision_id")
+        elif event_type == "wnba_alert":
+            body["sheet_tab"] = "Alerts"
+            body["upsert_key"] = "decision_id"
+            body["upsert_value"] = payload.get("decision_id")
+        elif event_type == "wnba_profile_summary":
+            body["sheet_tab"] = "Daily_Profile_Summary"
+        elif event_type == "wnba_feature_learning":
+            body["sheet_tab"] = "Feature_Learning"
     headers = {"Content-Type": "application/json"}
     if WNBA_TRACKING_WEBHOOK_SECRET:
         headers["X-SHIFT-SECRET"] = WNBA_TRACKING_WEBHOOK_SECRET
@@ -611,7 +632,7 @@ def post_tracking_event(event_type, payload):
 
 def wnba_decision_log_fieldnames():
     return [
-        "decision_id", "timestamp", "date", "event_id", "game", "action", "decision_type", "reject_reason",
+        "decision_id", "opportunity_id", "snapshot_id", "timestamp", "date", "event_id", "game", "action", "decision_type", "reject_reason", "pass_reason_category",
         "market_type", "engine", "side", "team_side", "team", "line", "price", "book",
         "scenario", "quarter_profile", "period", "clock", "minutes_remaining", "score", "score_margin_home",
         "opening_total", "live_total", "projected_total", "edge", "confidence", "value_score", "risk_score",
@@ -625,7 +646,8 @@ def wnba_decision_log_fieldnames():
         "market_overreaction_score", "expected_live_spread", "expected_live_ml", "expected_line_edge",
         "favorite_margin_at_alert", "spread_swing", "star_status", "starter_sit_risk", "data_quality",
         "closing_line", "closing_price", "clv", "post_5m_line", "post_5m_move", "final_score", "final_total",
-        "favorite_final_margin", "favorite_retook_control", "cover_margin", "result", "units", "graded_at",
+        "favorite_final_margin", "favorite_retook_control", "cover_margin", "result", "units", "would_have_units",
+        "actual_vs_would_delta", "missed_units", "decision_outcome_bucket", "graded_at", "result_update_key",
     ]
 
 def wnba_decision_action_from_opp(opp, approved=False, reason=""):
@@ -644,16 +666,45 @@ def wnba_decision_action_from_opp(opp, approved=False, reason=""):
         return "RESEARCH_ONLY"
     return "NO_BET"
 
-def wnba_decision_id(info, opp, action, reason=""):
+def canonical_line_bucket(value):
+    try:
+        v = float(value)
+        return str(round(v * 2) / 2.0)
+    except Exception:
+        return ""
+
+def wnba_opportunity_id(info, opp):
+    """Stable play identity: does not include clock, score, or reject reason."""
     side = str((opp or {}).get("side") or "NONE").upper()
-    line = str((opp or {}).get("line") or "")
+    team_side = str((opp or {}).get("team_side") or "")
     market = str((opp or {}).get("market_type") or "NONE")
     scenario = str((opp or {}).get("scenario") or "UNKNOWN")
-    reason_key = str(reason or "").lower()[:60]
-    return "|".join([
-        today(), str((info or {}).get("event_id") or ""), action, market, side, line,
-        str((info or {}).get("period") or ""), str((info or {}).get("clock") or ""), scenario, reason_key,
-    ])
+    line_bucket = canonical_line_bucket((opp or {}).get("line"))
+    return "|".join([today(), str((info or {}).get("event_id") or ""), market, side, team_side, scenario, line_bucket])
+
+def wnba_snapshot_id(info, opp, action):
+    bucket = int(time.time() // max(1, WNBA_SNAPSHOT_BUCKET_SECONDS))
+    return "|".join([wnba_opportunity_id(info, opp), str(action or ""), str(bucket)])
+
+def wnba_decision_id(info, opp, action, reason=""):
+    # Decision id is stable for this logged snapshot. opportunity_id groups all snapshots of the same betting idea.
+    return wnba_snapshot_id(info, opp, action)
+
+def pass_reason_category(reason="", decision_type=""):
+    text = f"{reason or ''} {decision_type or ''}".upper()
+    if "PRICE" in text or "EXPENSIVE" in text or "RECHECK" in text:
+        return "PRICE_PASS"
+    if "RISK" in text or "FOUL" in text or "STARTER" in text or "BLOWOUT" in text:
+        return "RISK_PASS"
+    if "DATA" in text or "NO_MARKET" in text or "MISSING" in text or "CONSENSUS" in text:
+        return "DATA_QUALITY_PASS"
+    if "LOCK" in text or "ONE STRIKE" in text or "EXPOSURE" in text or "COOLDOWN" in text:
+        return "EXPOSURE_PASS"
+    if "OPPOSITE" in text or "LOG" in text or "LEARNING" in text or "RESEARCH" in text:
+        return "RESEARCH_PASS"
+    if "GATE MISS" in text or "PREDICTOR" in text or "SAMPLE" in text:
+        return "MODEL_THRESHOLD_PASS"
+    return "OTHER_PASS"
 
 def should_log_wnba_decision(sg, decision_id, action):
     if not WNBA_ENABLE_DECISION_LOG or not decision_id:
@@ -688,6 +739,11 @@ def wnba_feature_extract(info, opp):
     run_sus = future.get("run_sustainability") or predictor.get("run_sustainability") or {}
     accel = future.get("acceleration") or {}
     fav_scores = scores if opp.get("market_type") in {"MONEYLINE", "FAVORITE_SPREAD_DROP", "SPREAD"} else {}
+    fav_ctx = fav_scores.get("favorite_context") or {}
+    dominance = fav_ctx.get("dominance") or {}
+    regression = fav_ctx.get("run_regression") or {}
+    overreaction = fav_scores.get("market_overreaction") or {}
+    expected_line = fav_scores.get("expected_line") or {}
     live_context = opp.get("live_context") or scores.get("live_context") or {}
     return {
         "pace_projected_possessions": pace.get("projected_game_possessions"),
@@ -703,13 +759,13 @@ def wnba_feature_extract(info, opp):
         "run_profile": run_sus.get("profile"),
         "run_unsustainable_score": run_sus.get("unsustainable_score"),
         "run_sustainable_score": run_sus.get("sustainable_score"),
-        "favorite_dominance_score": fav_scores.get("favorite_dominance_score") or fav_scores.get("dominance_score"),
-        "run_regression_score": fav_scores.get("run_regression_score"),
-        "market_overreaction_score": fav_scores.get("market_overreaction_score"),
-        "expected_live_spread": fav_scores.get("expected_live_spread"),
-        "expected_live_ml": fav_scores.get("expected_live_ml"),
-        "expected_line_edge": fav_scores.get("expected_line_edge"),
-        "favorite_margin_at_alert": fav_scores.get("favorite_margin") or fav_scores.get("favorite_margin_at_alert"),
+        "favorite_dominance_score": fav_scores.get("favorite_dominance_score") or fav_scores.get("dominance_score") or dominance.get("dominance_score"),
+        "run_regression_score": fav_scores.get("run_regression_score") or regression.get("run_regression_score"),
+        "market_overreaction_score": fav_scores.get("market_overreaction_score") or overreaction.get("market_overreaction_score"),
+        "expected_live_spread": fav_scores.get("expected_live_spread") or expected_line.get("expected_live_spread"),
+        "expected_live_ml": fav_scores.get("expected_live_ml") or expected_line.get("expected_ml_price"),
+        "expected_line_edge": fav_scores.get("expected_line_edge") or expected_line.get("expected_spread_edge") or expected_line.get("expected_ml_edge_pct"),
+        "favorite_margin_at_alert": fav_scores.get("favorite_margin") or fav_scores.get("favorite_margin_at_alert") or expected_line.get("favorite_margin_now"),
         "spread_swing": fav_scores.get("spread_swing"),
         "star_status": fav_scores.get("star_status"),
         "starter_sit_risk": live_context.get("starter_sit_risk") or fav_scores.get("starter_sit_risk"),
@@ -722,10 +778,14 @@ def wnba_decision_row_from_opp(info, label, opp, action, decision_type="", rejec
     md = opp.get("market_discrepancy") or {}
     scores = opp.get("scores") or {}
     features = wnba_feature_extract(info, opp)
+    opportunity_id = wnba_opportunity_id(info, opp)
+    snapshot_id = wnba_snapshot_id(info, opp, action)
     row = {
-        "decision_id": wnba_decision_id(info, opp, action, reject_reason),
+        "decision_id": snapshot_id,
+        "opportunity_id": opportunity_id,
+        "snapshot_id": snapshot_id,
         "timestamp": now_local().isoformat(), "date": today(), "event_id": info.get("event_id"), "game": label,
-        "action": action, "decision_type": decision_type, "reject_reason": reject_reason,
+        "action": action, "decision_type": decision_type, "reject_reason": reject_reason, "pass_reason_category": pass_reason_category(reject_reason, decision_type),
         "market_type": opp.get("market_type"), "engine": f"{opp.get('market_type')}|{opp.get('scenario')}",
         "side": opp.get("side"), "team_side": opp.get("team_side"), "team": opp.get("side") if opp.get("market_type") != "TOTAL" else "",
         "line": opp.get("line"), "price": opp.get("price"), "book": opp.get("book"),
@@ -744,7 +804,8 @@ def wnba_decision_row_from_opp(info, label, opp, action, decision_type="", rejec
         "alert_timing_quality": opp.get("alert_timing_quality"), "alert_timing_note": opp.get("alert_timing_note"),
         "closing_line": "", "closing_price": "", "clv": "", "post_5m_line": "", "post_5m_move": "",
         "final_score": "", "final_total": "", "favorite_final_margin": "", "favorite_retook_control": "", "cover_margin": "",
-        "result": "PENDING", "units": "", "graded_at": "",
+        "result": "PENDING", "units": "", "would_have_units": "", "actual_vs_would_delta": "",
+        "missed_units": "", "decision_outcome_bucket": "", "graded_at": "", "result_update_key": snapshot_id,
     }
     row.update(features)
     return row
@@ -812,13 +873,17 @@ def grade_completed_wnba_decision_log(event_id, label, final_score):
         r["favorite_retook_control"] = favorite_retook_control
         r["cover_margin"] = cover_margin
         r["result"] = result
-        # NO_BET and RESEARCH_ONLY are graded as would-have results but count 0u unless you choose to analyze passed-play audit.
-        if r.get("action") in {"BET_NOW", "TEST_UNIT"}:
-            r["units"] = result_units(result, r.get("price"), r.get("unit_size", 1.0))
-        else:
-            r["units"] = 0.0
+        actual_units, would_have_units, delta, missed_units, outcome_bucket = calculate_decision_outcome_units(
+            r.get("action"), result, r.get("price"), r.get("unit_size", UNIT_B), row=r
+        )
+        r["units"] = actual_units
+        r["would_have_units"] = would_have_units
+        r["actual_vs_would_delta"] = delta
+        r["missed_units"] = missed_units
+        r["decision_outcome_bucket"] = outcome_bucket
         r["graded_at"] = now_local().isoformat()
         changed = True
+        post_tracking_event("wnba_decision_result", {k: r.get(k, "") for k in wnba_decision_log_fieldnames()})
     if changed:
         write_csv_rows(WNBA_DECISION_LOG_FILE, wnba_decision_log_fieldnames(), rows)
         build_wnba_adaptive_config_from_decisions()
@@ -827,33 +892,63 @@ def grade_completed_wnba_decision_log(event_id, label, final_score):
 def build_wnba_adaptive_config_from_decisions():
     if not WNBA_ENABLE_ADAPTIVE_CONFIG:
         return {}
-    rows = [r for r in read_csv_rows(WNBA_DECISION_LOG_FILE) if r.get("action") in {"BET_NOW", "TEST_UNIT"} and r.get("result") in {"WIN", "LOSS", "PUSH"}]
+    all_rows = [r for r in read_csv_rows(WNBA_DECISION_LOG_FILE) if r.get("result") in {"WIN", "LOSS", "PUSH"}]
+    if not all_rows:
+        return {}
     buckets = {}
-    for r in rows:
+    for r in all_rows:
         key = f"{r.get('market_type')}|{r.get('scenario')}|{r.get('quarter_profile')}|{str(r.get('side','')).upper()}"
-        buckets.setdefault(key, []).append(r)
+        rec = buckets.setdefault(key, {"accepted": [], "passed": []})
+        if r.get("action") in {"BET_NOW", "TEST_UNIT"}:
+            rec["accepted"].append(r)
+        elif WNBA_ENABLE_PASSED_PLAY_ADAPTIVE_LEARNING and r.get("action") in {"NO_BET", "RESEARCH_ONLY"}:
+            rec["passed"].append(r)
     config = {}
-    for key, bucket in buckets.items():
-        wins = sum(1 for r in bucket if r.get("result") == "WIN")
-        losses = sum(1 for r in bucket if r.get("result") == "LOSS")
-        pushes = sum(1 for r in bucket if r.get("result") == "PUSH")
-        sample = wins + losses + pushes
-        units = round(sum(safe_float(r.get("units"), 0) for r in bucket), 2)
-        risked = round(sum(safe_float(r.get("unit_size"), 0) or 1.0 for r in bucket if r.get("result") in {"WIN", "LOSS", "PUSH"}), 2)
+    for key, rec in buckets.items():
+        accepted = rec["accepted"]
+        passed = rec["passed"]
+        accepted_sample = len(accepted)
+        passed_sample = len(passed)
+        wins = sum(1 for r in accepted if r.get("result") == "WIN")
+        losses = sum(1 for r in accepted if r.get("result") == "LOSS")
+        pushes = sum(1 for r in accepted if r.get("result") == "PUSH")
+        units = round(sum(safe_float(r.get("units"), 0) for r in accepted), 2)
+        risked = round(sum(safe_float(r.get("unit_size"), 0) or 1.0 for r in accepted), 2)
         roi = round(units / risked, 4) if risked else 0.0
-        clvs = [safe_float(r.get("clv"), None) for r in bucket if r.get("clv") not in (None, "")]
+        passed_units = round(sum(safe_float(r.get("would_have_units"), 0) for r in passed), 2)
+        passed_wins = sum(1 for r in passed if r.get("result") == "WIN")
+        passed_losses = sum(1 for r in passed if r.get("result") == "LOSS")
+        clvs = [safe_float(r.get("clv"), None) for r in accepted if r.get("clv") not in (None, "")]
         clvs = [c for c in clvs if c is not None]
         avg_clv = round(sum(clvs) / len(clvs), 2) if clvs else 0.0
-        if sample < WNBA_MIN_ADAPTIVE_SAMPLE:
-            status, adj = "OPEN_TEST", 0
-        elif roi >= WNBA_ADAPTIVE_STRONG_ROI and avg_clv >= WNBA_ADAPTIVE_STRONG_CLV:
-            status, adj = "PROVEN", 3
-        elif roi <= WNBA_ADAPTIVE_WEAK_ROI or avg_clv <= WNBA_ADAPTIVE_WEAK_CLV:
-            status, adj = "TIGHTEN", -4
-        else:
-            status, adj = "HOLD", 0
-        config[key] = {"sample": sample, "wins": wins, "losses": losses, "pushes": pushes, "units": units, "risked": risked, "roi": roi, "avg_clv": avg_clv, "status": status, "confidence_adjustment": adj, "updated_at": now_local().isoformat()}
+
+        status, adj = "OPEN_TEST", 0
+        loosen_reason = ""
+        if accepted_sample >= WNBA_MIN_ADAPTIVE_SAMPLE:
+            if roi >= WNBA_ADAPTIVE_STRONG_ROI and avg_clv >= WNBA_ADAPTIVE_STRONG_CLV:
+                status, adj = "PROVEN", 3
+            elif roi <= WNBA_ADAPTIVE_WEAK_ROI or avg_clv <= WNBA_ADAPTIVE_WEAK_CLV:
+                status, adj = "TIGHTEN", -4
+            else:
+                status, adj = "HOLD", 0
+        if WNBA_ENABLE_PASSED_PLAY_ADAPTIVE_LEARNING and passed_sample >= WNBA_PASSED_PLAY_MIN_SAMPLE:
+            if passed_units >= WNBA_PASSED_PLAY_LOOSEN_UNITS and status not in {"PROVEN"}:
+                status = "LOOSEN_CANDIDATE"
+                adj = max(adj, 2)
+                loosen_reason = "passed plays profitable; review rejected threshold"
+            elif passed_units <= WNBA_PASSED_PLAY_TIGHTEN_UNITS and status == "OPEN_TEST":
+                status = "GOOD_PASS"
+                adj = min(adj, -1)
+                loosen_reason = "passed plays losing; rejection filter likely useful"
+        config[key] = {
+            "accepted_sample": accepted_sample, "passed_sample": passed_sample,
+            "wins": wins, "losses": losses, "pushes": pushes, "units": units, "risked": risked, "roi": roi,
+            "passed_wins": passed_wins, "passed_losses": passed_losses, "passed_would_units": passed_units,
+            "avg_clv": avg_clv, "status": status, "confidence_adjustment": adj,
+            "learning_note": loosen_reason, "updated_at": now_local().isoformat(),
+        }
     save_json(WNBA_ADAPTIVE_CONFIG_FILE, config)
+    post_tracking_event("wnba_adaptive_config", {"date": today(), "profiles": config})
     return config
 
 def wnba_decision_report_lines(report_date=None):
@@ -867,14 +962,48 @@ def wnba_decision_report_lines(report_date=None):
         pending = [r for r in rows if r.get("action") == action and r.get("result") not in {"WIN", "LOSS", "PUSH"}]
         if bucket:
             sm = summarize_rows(bucket)
-            lines.append(f"• {action}: {sm['wins']}-{sm['losses']}-{sm['pushes']} | {sm['units']}u | pending {len(pending)}")
+            would_units = round(sum(safe_float(r.get("would_have_units"), 0) for r in bucket), 2)
+            missed_units = round(sum(safe_float(r.get("missed_units"), 0) for r in bucket), 2)
+            if action in {"BET_NOW", "TEST_UNIT"}:
+                lines.append(f"• {action}: {sm['wins']}-{sm['losses']}-{sm['pushes']} | actual {sm['units']}u | pending {len(pending)}")
+            else:
+                lines.append(f"• {action}: {sm['wins']}-{sm['losses']}-{sm['pushes']} | would-have {would_units}u | missed/avoided {missed_units}u | pending {len(pending)}")
         elif pending:
             lines.append(f"• {action}: {len(pending)} pending")
-    passed = [r for r in rows if r.get("action") == "NO_BET" and r.get("result") in {"WIN", "LOSS", "PUSH"}]
+    passed = [r for r in rows if r.get("action") in {"NO_BET", "RESEARCH_ONLY"} and r.get("result") in {"WIN", "LOSS", "PUSH"}]
     if passed:
         would_wins = sum(1 for r in passed if r.get("result") == "WIN")
         would_losses = sum(1 for r in passed if r.get("result") == "LOSS")
-        lines.append(f"• Passed-play audit: would-have {would_wins}-{would_losses}; useful for loosening/tightening gates")
+        would_units = round(sum(safe_float(r.get("would_have_units"), 0) for r in passed), 2)
+        lines.append(f"• Passed-play audit: would-have {would_wins}-{would_losses} | {would_units}u theoretical; this is the loosen/tighten signal")
+    return lines
+
+
+def wnba_passed_play_learning_lines(report_date=None):
+    """Show rejected/research profiles that would have helped or hurt if bet."""
+    report_date = report_date or today()
+    rows = [r for r in read_csv_rows(WNBA_DECISION_LOG_FILE)
+            if r.get("date") == report_date
+            and r.get("action") in {"NO_BET", "RESEARCH_ONLY"}
+            and r.get("result") in {"WIN", "LOSS", "PUSH"}]
+    if not rows:
+        return ["Passed Play Learning: building sample."]
+    buckets = {}
+    for r in rows:
+        key = f"{r.get('market_type')}|{r.get('scenario')}|{r.get('quarter_profile')}|{str(r.get('side','')).upper()}"
+        buckets.setdefault(key, []).append(r)
+    ranked = []
+    for key, bucket in buckets.items():
+        wins = sum(1 for r in bucket if r.get("result") == "WIN")
+        losses = sum(1 for r in bucket if r.get("result") == "LOSS")
+        pushes = sum(1 for r in bucket if r.get("result") == "PUSH")
+        would_units = round(sum(safe_float(r.get("would_have_units"), 0) for r in bucket), 2)
+        avg_clv = avg([r.get("clv") for r in bucket if r.get("clv") not in (None, "")], 0.0)
+        ranked.append((would_units, key, wins, losses, pushes, len(bucket), avg_clv))
+    lines = ["Passed Play Learning:"]
+    for would_units, key, wins, losses, pushes, sample, avg_clv in sorted(ranked, reverse=True)[:6]:
+        tag = "LOOSEN_CANDIDATE" if would_units > 0 else "GOOD_PASS" if would_units < 0 else "MONITOR"
+        lines.append(f"• {key}: would-have {wins}-{losses}-{pushes} | {would_units}u | CLV {avg_clv} | n={sample} | {tag}")
     return lines
 
 def wnba_feature_learning_lines(report_date=None):
@@ -4560,6 +4689,95 @@ def calculate_clv(strike_row, current_line):
 
     return ""
 
+
+def decision_row_time(row):
+    return row.get("timestamp") or row.get("time") or ""
+
+def decision_outcome_bucket_for_pass(row, result, hypothetical):
+    """Separate a useful missed winner from a good pass/avoided loss."""
+    action = row.get("action")
+    category = row.get("pass_reason_category") or pass_reason_category(row.get("reject_reason"), row.get("decision_type"))
+    clv = safe_float(row.get("clv"), 0) if row.get("clv") not in (None, "") else 0
+    if action in {"BET_NOW", "TEST_UNIT"}:
+        return "ACCEPTED_BET_GRADED"
+    if result == "WIN":
+        if category in {"PRICE_PASS", "DATA_QUALITY_PASS", "EXPOSURE_PASS"}:
+            return f"PASSED_WIN_ACCEPTABLE_{category}"
+        if clv >= GOOD_CLV_THRESHOLD:
+            return "TRUE_MISSED_EDGE_GOOD_CLV"
+        return f"PASSED_WIN_REVIEW_{category}"
+    if result == "LOSS":
+        return f"GOOD_PASS_AVOIDED_LOSS_{category}"
+    return f"PASSED_PUSH_NEUTRAL_{category}"
+
+def calculate_decision_outcome_units(action, result, price, unit_size, row=None):
+    """Return actual and hypothetical units for accepted and passed decisions."""
+    row = row or {}
+    stake = safe_float(unit_size, UNIT_B)
+    if stake <= 0:
+        stake = UNIT_B
+    hypothetical = result_units(result, price, stake)
+    if action in {"BET_NOW", "TEST_UNIT"}:
+        actual = hypothetical
+        missed = 0.0
+    else:
+        actual = 0.0
+        missed = hypothetical
+    bucket = decision_outcome_bucket_for_pass({**row, "action": action}, result, hypothetical)
+    return round(actual, 2), round(hypothetical, 2), round(actual - hypothetical, 2), round(missed, 2), bucket
+
+def update_decision_market_tracking(label, info, markets):
+    """Track CLV and 5-minute market movement for every logged decision, not only SMS alerts.
+
+    Google Sheets webhooks append records, so this also emits a wnba_decision_market_update
+    event whenever a decision row receives CLV or post-5m movement fields.
+    """
+    if not WNBA_ENABLE_DECISION_LOG:
+        return
+    rows = read_csv_rows(WNBA_DECISION_LOG_FILE)
+    if not rows:
+        return
+    changed = False
+    now_dt = now_local()
+    for r in rows:
+        if r.get("date") != today() or str(r.get("event_id")) != str(info.get("event_id")):
+            continue
+        if r.get("result") in {"WIN", "LOSS", "PUSH"}:
+            continue
+        current_line, current_price, book = find_current_line_for_strike(markets, r)
+        clv = calculate_clv(r, current_line)
+        row_changed = False
+        if clv != "":
+            r["closing_line"] = current_line
+            r["closing_price"] = current_price
+            r["clv"] = clv
+            row_changed = True
+        # 5-minute move for all decisions, not just BET_NOW.
+        if r.get("post_5m_move") in (None, ""):
+            try:
+                decision_dt = datetime.fromisoformat(decision_row_time(r))
+                age_min = (now_dt - decision_dt).total_seconds() / 60.0
+            except Exception:
+                age_min = 0
+            if age_min >= POST_ALERT_MOVE_CHECK_MINUTES:
+                move, quality, note = calculate_post_alert_move(r, current_line, current_price)
+                if move != "":
+                    r["post_5m_line"] = current_line
+                    r["post_5m_move"] = move
+                    # Reuse alert_timing fields rather than adding another massive set of columns.
+                    if not r.get("alert_timing_quality"):
+                        r["alert_timing_quality"] = quality
+                    if not r.get("alert_timing_note"):
+                        r["alert_timing_note"] = note
+                    row_changed = True
+        if row_changed:
+            changed = True
+            payload = {k: r.get(k, "") for k in wnba_decision_log_fieldnames()}
+            payload["market_tracking_updated_at"] = now_local().isoformat()
+            post_tracking_event("wnba_decision_market_update", payload)
+    if changed:
+        write_csv_rows(WNBA_DECISION_LOG_FILE, wnba_decision_log_fieldnames(), rows)
+
 def update_clv_snapshots(label, info, markets):
     rows = read_csv_rows(STRIKE_HISTORY_FILE)
     if not rows:
@@ -4979,6 +5197,8 @@ def format_daily_report(summary):
     ]
     lines.extend(wnba_decision_report_lines(summary.get('date')))
     lines.append("")
+    lines.extend(wnba_passed_play_learning_lines(summary.get('date')))
+    lines.append("")
     lines.extend(wnba_feature_learning_lines(summary.get('date')))
     lines.extend([
         "",
@@ -5162,6 +5382,7 @@ def run_once():
         recent_game_snapshots(sg, info)
         update_clv_snapshots(label, info, markets)
         update_post_alert_movement(label, info, markets)
+        update_decision_market_tracking(label, info, markets)
 
         mode = "ACTIVE" if is_live_status(comp) else "PREGAME"
         total_line = (markets.get("total") or {}).get("point")
@@ -5229,7 +5450,7 @@ def main():
     print(f"BOOT: {APP_BUILD_LABEL}")
     print(f"DATE: {today()} | TZ: America/Phoenix")
     print(f"Playable books: {USER_PLAYABLE_BOOKS}")
-    print("Strategy: WNBA BetMGM Pro V3.2 — Google Sheets decision database, every accepted/refused decision, feature learning, adaptive profile config, and V3.1 market controls.")
+    print("Strategy: WNBA BetMGM Pro V3.4 — stable decision/opportunity IDs, Sheets upsert hints, accepted + passed-play outcome grading, feature learning, and adaptive profile config.")
     while True:
         try:
             sleep_for = run_once()
