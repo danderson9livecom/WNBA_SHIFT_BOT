@@ -57,8 +57,8 @@ load_dotenv()
 # =============================================================================
 # Identity / timezone / files
 # =============================================================================
-APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V3.4.0")
-APP_MODE = "BETMGM PRO V3.4 + DECISION LEARNING UPSERT"
+APP_VERSION = os.getenv("SHIFT_WNBA_APP_VERSION", "V3.5.0")
+APP_MODE = "BETMGM PRO V3.5 + EXACT SHEETS TAB EXPORTS"
 APP_BUILD_LABEL = f"SHIFT WNBA {APP_VERSION} {APP_MODE}"
 TZ = ZoneInfo("America/Phoenix")
 
@@ -593,41 +593,77 @@ def write_csv_rows(path, fieldnames, rows):
 def tracking_webhook_enabled():
     return bool(WNBA_ENABLE_TRACKING_WEBHOOK and WNBA_TRACKING_WEBHOOK_URL.startswith(("http://", "https://")))
 
+# Exact Google Sheets tab names used by the WNBA workbook.
+# Keep these names in sync with the tabs in Google Sheets.
+WNBA_SHEETS_TAB_MAP = {
+    "wnba_decision": "wnba_decision",
+    "daily_learning_report": "daily_learning_report",
+    "strike_graded": "strike_graded",
+    "strike_stored": "strike_stored",
+    "clv_poll_snapshot": "clv_poll_snapshot",
+    "graded_result": "graded_result",
+    "adaptive_profile": "adaptive_profile",
+    "feature_learning": "feature_learning",
+    # Backward-compatible aliases from older WNBA builds.
+    "wnba_strike": "strike_stored",
+    "wnba_result": "strike_graded",
+    "wnba_decision_result": "graded_result",
+    "wnba_decision_market_update": "clv_poll_snapshot",
+    "wnba_adaptive_config": "adaptive_profile",
+    "wnba_feature_learning": "feature_learning",
+}
+
 def post_tracking_event(event_type, payload):
-    """Optional Google Sheets Apps Script / Zapier / Make mirror. Local CSV always remains primary."""
+    """Optional Google Sheets Apps Script / Zapier / Make mirror. Local CSV always remains primary.
+
+    V3.5 change: send exact WNBA tab names. The Apps Script can route by either
+    event_type or sheet_tab, so both are set to the workbook's expected tab name.
+    """
     if not tracking_webhook_enabled():
         return False
+
+    original_event_type = event_type
+    sheet_tab = WNBA_SHEETS_TAB_MAP.get(event_type, event_type)
+    event_type = sheet_tab
+
     body = {
         "event_type": event_type,
+        "original_event_type": original_event_type,
+        "sheet_tab": sheet_tab,
         "sent_at": now_local().isoformat(),
-        "source": "SHIFT_WNBA_V3_4_DECISION_LEARNING_UPSERT",
+        "source": "SHIFT_WNBA_V3_5_EXACT_SHEETS_TAB_EXPORTS",
         "payload": payload,
     }
     if WNBA_ENABLE_SHEETS_UPSERT_HINTS and isinstance(payload, dict):
-        # Apps Script can use these hints to route and update rows instead of only appending.
-        if event_type in {"wnba_decision", "wnba_decision_market_update", "wnba_decision_result"}:
-            body["sheet_tab"] = "Decision_Database"
+        if sheet_tab == "wnba_decision":
             body["upsert_key"] = WNBA_DECISION_UPSERT_KEY
             body["upsert_value"] = payload.get(WNBA_DECISION_UPSERT_KEY) or payload.get("decision_id")
-        elif event_type == "wnba_alert":
-            body["sheet_tab"] = "Alerts"
+        elif sheet_tab == "graded_result":
+            body["upsert_key"] = "result_update_key"
+            body["upsert_value"] = payload.get("result_update_key") or payload.get("snapshot_id") or payload.get("decision_id")
+        elif sheet_tab == "strike_stored":
             body["upsert_key"] = "decision_id"
-            body["upsert_value"] = payload.get("decision_id")
-        elif event_type == "wnba_profile_summary":
-            body["sheet_tab"] = "Daily_Profile_Summary"
-        elif event_type == "wnba_feature_learning":
-            body["sheet_tab"] = "Feature_Learning"
+            body["upsert_value"] = payload.get("decision_id") or payload.get("snapshot_id")
+        elif sheet_tab == "strike_graded":
+            body["upsert_key"] = "strike_grade_key"
+            body["upsert_value"] = payload.get("strike_grade_key") or "|".join(str(payload.get(k, "")) for k in ["event_id", "time", "market_type", "side", "line"])
+        elif sheet_tab == "clv_poll_snapshot":
+            body["upsert_key"] = "clv_snapshot_key"
+            body["upsert_value"] = payload.get("clv_snapshot_key") or payload.get("snapshot_id") or "|".join(str(payload.get(k, "")) for k in ["event_id", "time", "market_type", "side", "entry_line", "current_line"])
+        elif sheet_tab in {"adaptive_profile", "feature_learning", "daily_learning_report"}:
+            body["upsert_key"] = payload.get("upsert_key", "date")
+            body["upsert_value"] = payload.get("upsert_value") or payload.get("date") or today()
     headers = {"Content-Type": "application/json"}
     if WNBA_TRACKING_WEBHOOK_SECRET:
         headers["X-SHIFT-SECRET"] = WNBA_TRACKING_WEBHOOK_SECRET
     try:
         r = requests.post(WNBA_TRACKING_WEBHOOK_URL, json=body, headers=headers, timeout=10)
         if 200 <= r.status_code < 300:
-            print(f"TRACKING WEBHOOK SENT | {event_type}")
+            print(f"TRACKING WEBHOOK SENT | {sheet_tab}")
             return True
-        print(f"TRACKING WEBHOOK ERROR | {event_type} | {r.status_code} | {r.text[:180]}")
+        print(f"TRACKING WEBHOOK ERROR | {sheet_tab} | {r.status_code} | {r.text[:180]}")
     except Exception as e:
-        print(f"TRACKING WEBHOOK EXCEPTION | {event_type}:", repr(e))
+        print(f"TRACKING WEBHOOK EXCEPTION | {sheet_tab}:", repr(e))
     return False
 
 def wnba_decision_log_fieldnames():
@@ -883,7 +919,7 @@ def grade_completed_wnba_decision_log(event_id, label, final_score):
         r["decision_outcome_bucket"] = outcome_bucket
         r["graded_at"] = now_local().isoformat()
         changed = True
-        post_tracking_event("wnba_decision_result", {k: r.get(k, "") for k in wnba_decision_log_fieldnames()})
+        post_tracking_event("graded_result", {k: r.get(k, "") for k in wnba_decision_log_fieldnames()})
     if changed:
         write_csv_rows(WNBA_DECISION_LOG_FILE, wnba_decision_log_fieldnames(), rows)
         build_wnba_adaptive_config_from_decisions()
@@ -948,7 +984,13 @@ def build_wnba_adaptive_config_from_decisions():
             "learning_note": loosen_reason, "updated_at": now_local().isoformat(),
         }
     save_json(WNBA_ADAPTIVE_CONFIG_FILE, config)
-    post_tracking_event("wnba_adaptive_config", {"date": today(), "profiles": config})
+    for profile_key, profile_payload in config.items():
+        row_payload = {"date": today(), "profile": profile_key}
+        if isinstance(profile_payload, dict):
+            row_payload.update(profile_payload)
+        row_payload["upsert_key"] = "date_profile"
+        row_payload["upsert_value"] = f"{today()}|{profile_key}"
+        post_tracking_event("adaptive_profile", row_payload)
     return config
 
 def wnba_decision_report_lines(report_date=None):
@@ -1036,6 +1078,12 @@ def wnba_feature_learning_lines(report_date=None):
         append_csv(WNBA_FEATURE_LEARNING_FILE, summary_rows[0], list(summary_rows[0].keys())) if not os.path.exists(WNBA_FEATURE_LEARNING_FILE) else None
         # Rewrite as current snapshot to keep the file readable.
         write_csv_rows(WNBA_FEATURE_LEARNING_FILE, list(summary_rows[0].keys()), summary_rows)
+        for row_payload in summary_rows:
+            row_payload = dict(row_payload)
+            row_payload["date"] = report_date or today()
+            row_payload["upsert_key"] = "date_bucket"
+            row_payload["upsert_value"] = f"{row_payload.get('date')}|{row_payload.get('bucket')}"
+            post_tracking_event("feature_learning", row_payload)
     return lines
 
 def normalize_team(name):
@@ -4472,7 +4520,7 @@ def log_strike(info, label, opp):
         "closing_line": "", "closing_price": "", "clv": "", "expected_close_delta": "",
         "final_score": "", "final_total": "", "result": "", "units": "",
     }, STRIKE_FIELDS)
-    post_tracking_event("wnba_strike", {
+    post_tracking_event("strike_stored", {
         "date": today(), "time": now_local().isoformat(), "event_id": info.get("event_id"), "game": label,
         "market_type": opp.get("market_type"), "side": opp.get("side"), "team_side": opp.get("team_side"),
         "line": opp.get("line"), "price": opp.get("price"), "book": opp.get("book"),
@@ -4774,7 +4822,7 @@ def update_decision_market_tracking(label, info, markets):
             changed = True
             payload = {k: r.get(k, "") for k in wnba_decision_log_fieldnames()}
             payload["market_tracking_updated_at"] = now_local().isoformat()
-            post_tracking_event("wnba_decision_market_update", payload)
+            post_tracking_event("clv_poll_snapshot", payload)
     if changed:
         write_csv_rows(WNBA_DECISION_LOG_FILE, wnba_decision_log_fieldnames(), rows)
 
@@ -4791,7 +4839,7 @@ def update_clv_snapshots(label, info, markets):
         clv = calculate_clv(r, current_line)
         if clv == "":
             continue
-        append_csv(CLV_HISTORY_FILE, {
+        clv_payload = {
             "date": today(), "time": now_local().isoformat(),
             "event_id": info.get("event_id"), "game": label,
             "market_type": r.get("market_type"), "side": r.get("side"),
@@ -4799,10 +4847,13 @@ def update_clv_snapshots(label, info, markets):
             "current_line": current_line, "entry_price": r.get("price"),
             "current_price": current_price, "book": book,
             "clv": clv, "period": info.get("period"), "clock": info.get("clock"),
-        }, [
+        }
+        clv_payload["clv_snapshot_key"] = "|".join(str(clv_payload.get(k, "")) for k in ["event_id", "time", "market_type", "side", "entry_line", "current_line"])
+        append_csv(CLV_HISTORY_FILE, clv_payload, [
             "date","time","event_id","game","market_type","side","team_side",
-            "entry_line","current_line","entry_price","current_price","book","clv","period","clock"
+            "entry_line","current_line","entry_price","current_price","book","clv","period","clock","clv_snapshot_key"
         ])
+        post_tracking_event("clv_poll_snapshot", clv_payload)
 
 def latest_clv_for_strike(row):
     snaps = [
@@ -4897,7 +4948,9 @@ def grade_completed_strikes(event_id, label, final_score):
         append_csv(GRADED_RESULTS_FILE, out, list(out.keys()))
         new_graded.append(out)
         print(f"GRADED | {label} | {market_type} {side} {line} | {result} | CLV {clv} | Final {final_score}")
-        post_tracking_event("wnba_result", out)
+        out["strike_grade_key"] = "|".join(str(out.get(k, "")) for k in ["event_id", "time", "market_type", "side", "line"])
+        post_tracking_event("strike_graded", out)
+        post_tracking_event("graded_result", out)
 
     return new_graded
 
@@ -5013,12 +5066,16 @@ def summarize_today():
     summary["season_summary"] = season_summary
     summary["adaptive_rules"] = adaptive_rules
 
-    append_csv(DAILY_SUMMARY_FILE, {
+    daily_payload = {
         "date": today(), "graded": graded, "wins": wins, "losses": losses, "pushes": pushes,
         "win_pct": win_pct, "units": units, "strikes": len(strikes), "near_misses": len(near),
         "avg_clv": avg_clv, "positive_clv_count": positive_clv, "clv_snapshots": len(clv_rows),
-        "avg_predictor": avg_predictor,
-    }, ["date","graded","wins","losses","pushes","win_pct","units","strikes","near_misses","avg_clv","positive_clv_count","clv_snapshots"])
+        "avg_predictor": avg_predictor, "risked": summary.get("risked"), "roi": summary.get("roi"),
+        "ending_bankroll": summary.get("ending_bankroll"),
+        "best_profile": summary.get("best_profile"), "worst_profile": summary.get("worst_profile"),
+    }
+    append_csv(DAILY_SUMMARY_FILE, daily_payload, ["date","graded","wins","losses","pushes","win_pct","units","strikes","near_misses","avg_clv","positive_clv_count","clv_snapshots","avg_predictor","risked","roi","ending_bankroll","best_profile","worst_profile"])
+    post_tracking_event("daily_learning_report", daily_payload)
 
     return summary
 
